@@ -5381,9 +5381,11 @@ fn flags_used_by(line: Option<&str>) -> bool {
     let Some(line) = line else { return false };
     let t = line.trim();
     let op = t.split_whitespace().next().unwrap_or("");
+    // `jmp` reads no flags, but treating it as a reader only blocks a fold.
     op.starts_with('j')
         || op.starts_with("set")
-        || matches!(op, "adc" | "sbb" | "cmov" | "cmovb" | "cmove" | "cmovne")
+        || op.starts_with("cmov")
+        || matches!(op, "adc" | "sbb" | "pushf" | "pushfq" | "lahf")
 }
 
 /// Replace every whole-operand occurrence of `from` with `to`.
@@ -5452,7 +5454,8 @@ fn fuse_imm(body: &str) -> String {
                     // three. A loop-carried multiply by a small constant sits on
                     // the critical path, so this is worth two cycles an
                     // iteration even though it is the same instruction count.
-                    if op == "imul" && d == t && a != t {
+                    let flags_read = flags_used_by(lines.get(i + 2).copied());
+                    if op == "imul" && d == t && a != t && !flags_read {
                         if let Some(lea) = scaled_lea(k, a, t) {
                             out.push_str(&lea);
                             out.push('\n');
@@ -5463,8 +5466,13 @@ fn fuse_imm(body: &str) -> String {
                     // `mov $k, %t; add %s, %t` -> `lea k(%s), %t`. The result
                     // stays in `%t`, so the fold does not care whether `%t` is
                     // read later; only `%s` has to be a register.
-                    if d == t && a != t && (op == "add" || op == "sub") {
-                        let disp = if op == "add" { k } else { -k };
+                    //
+                    // Only `add` qualifies. `mov $k, %t; sub %s, %t` computes
+                    // `k - s`, which no displacement expresses: folding it to
+                    // `lea -k(%s)` computed `s - k`, so `5 - x` returned `x - 5`
+                    // (and `0 - x`, i.e. `wrapping_neg`, returned `x`).
+                    if d == t && a != t && op == "add" && !flags_read {
+                        let disp = k;
                         if disp == 0 {
                             out.push_str(&format!("  mov {a}, {t}\n"));
                             i += 2;
@@ -5589,7 +5597,11 @@ fn fuse_lea(body: &str) -> String {
         if let Some((a, t)) = mov_reg_reg(lines[i]) {
             if SCRATCH.contains(&t) {
                 if let Some((op, k, arith_dst)) = addsub_imm(lines[i + 1]) {
-                    if arith_dst == t && a != t && k.unsigned_abs() < (1 << 31) {
+                    if arith_dst == t
+                        && a != t
+                        && k.unsigned_abs() < (1 << 31)
+                        && !flags_used_by(lines.get(i + 2).copied())
+                    {
                         if let Some(j) = (i + 2..lines.len()).find(|j| reg_mentions(lines[*j], t)) {
                             if let Some((t2, d)) = mov_reg_reg(lines[j]) {
                                 // Nothing between may touch `a` or `d`; the
@@ -6074,26 +6086,38 @@ fn store_slot(line: &str) -> Option<&str> {
 /// others: forwarding a store to its reader lets the store be dropped, which
 /// lets the arithmetic that fed it fuse into a `lea`.
 fn optimize(body: &str) -> String {
-    let mut body = peephole(body);
-    body = drop_dead_jumps(&body);
-    body = drop_noop_arith(&body);
-    for _ in 0..2 {
-        body = fuse_imm(&body);
-        body = fuse_lea(&body);
-        body = coalesce_scratch(&body);
-        body = drop_round_trips(&body);
-        body = propagate_copies(&body);
-        body = fold_load_copies(&body);
-        body = forward_stores(&body);
-        body = fold_addresses(&body);
-        body = fold_lea_terms(&body);
-        body = fold_local_offsets(&body);
-        body = dead_stores(&body);
-        body = drop_unread_stores(&body);
-        body = drop_noop_arith(&body);
+    // `RMC_TRACE_PEEPHOLE=1` prints every pass that changed the body to stderr,
+    // so a miscompile can be bisected to the rewrite that introduced it.
+    let trace = std::env::var_os("RMC_TRACE_PEEPHOLE").is_some();
+    let step = |name: &str, f: fn(&str) -> String, body: String| -> String {
+        let out = f(&body);
+        if trace && out != body {
+            eprintln!("--- peephole: {name}\n{out}");
+        }
+        out
+    };
+    if trace {
+        eprintln!("--- peephole: input\n{body}");
     }
-    body = interleave_div_pairs(&body);
-    body
+    let mut body = step("peephole", peephole, body.to_string());
+    body = step("drop_dead_jumps", drop_dead_jumps, body);
+    body = step("drop_noop_arith", drop_noop_arith, body);
+    for _ in 0..2 {
+        body = step("fuse_imm", fuse_imm, body);
+        body = step("fuse_lea", fuse_lea, body);
+        body = step("coalesce_scratch", coalesce_scratch, body);
+        body = step("drop_round_trips", drop_round_trips, body);
+        body = step("propagate_copies", propagate_copies, body);
+        body = step("fold_load_copies", fold_load_copies, body);
+        body = step("forward_stores", forward_stores, body);
+        body = step("fold_addresses", fold_addresses, body);
+        body = step("fold_lea_terms", fold_lea_terms, body);
+        body = step("fold_local_offsets", fold_local_offsets, body);
+        body = step("dead_stores", dead_stores, body);
+        body = step("drop_unread_stores", drop_unread_stores, body);
+        body = step("drop_noop_arith", drop_noop_arith, body);
+    }
+    step("interleave_div_pairs", interleave_div_pairs, body)
 }
 
 /// Interleave two adjacent `mul`/`div`-by-constant units so the two long
@@ -6946,6 +6970,48 @@ fn main() -> () {
         crate::mir::layout_blocks(&mut prog);
         let asm = compile(&prog, &Options::default()).expect("compile");
         assert!(asm.contains("main:"), "main not emitted:\n{asm}");
+    }
+
+    /// `mov $k, %t; sub %s, %t` is `k - s`. No `lea` displacement expresses
+    /// that, so the pair must survive; folding it to `lea -k(%s)` computed
+    /// `s - k` (`5 - x` printed `x - 5`, `wrapping_neg` printed `x`).
+    #[test]
+    fn a_constant_minus_a_register_is_not_an_lea() {
+        let body = "  mov $5, %rax\n  sub %rbx, %rax\n  mov %rax, %rdi\n";
+        assert_eq!(fuse_imm(body), body);
+        let zero = "  mov $0, %rax\n  sub %rbx, %rax\n";
+        assert_eq!(fuse_imm(zero), zero);
+    }
+
+    /// `mov $k, %t; add %s, %t` is `s + k` and folds to `lea k(%s), %t`, but
+    /// `lea` sets no flags: when the next instruction reads them (the `seto`
+    /// of an overflow-checked add) the `add` must stay.
+    #[test]
+    fn a_constant_plus_a_register_folds_unless_its_flags_are_read() {
+        let out = fuse_imm("  mov $5, %rax\n  add %rbx, %rax\n  mov %rax, %rdi\n");
+        assert!(out.contains("lea 5(%rbx), %rax"), "{out}");
+        let checked = "  mov $5, %rax\n  add %rbx, %rax\n  seto %al\n";
+        assert_eq!(fuse_imm(checked), checked);
+        let scaled = "  mov $3, %rax\n  imul %rbx, %rax\n  jo .Lovf\n";
+        assert_eq!(fuse_imm(scaled), scaled);
+    }
+
+    /// `fuse_lea` drops the `add`/`sub` that set the flags; a following
+    /// conditional jump or `set`/`cmov` still needs them.
+    #[test]
+    fn fuse_lea_keeps_an_arithmetic_whose_flags_are_read() {
+        let body = "  mov %rbx, %rax\n  sub $1, %rax\n  seto %cl\n  mov %rax, %rdi\n";
+        assert_eq!(fuse_lea(body), body);
+    }
+
+    /// Every conditional move reads the flags, not only the four spellings the
+    /// first version listed.
+    #[test]
+    fn every_conditional_move_reads_the_flags() {
+        for op in ["cmovg", "cmovl", "cmovge", "cmovle", "cmova", "cmovae", "cmovs", "cmovo"] {
+            assert!(flags_used_by(Some(&format!("  {op} %rcx, %rax"))), "{op}");
+        }
+        assert!(!flags_used_by(Some("  mov %rcx, %rax")));
     }
 
     /// `add $0, %reg` cannot change its destination and is dropped; the same
