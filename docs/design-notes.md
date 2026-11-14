@@ -3356,3 +3356,94 @@ example `__rmc_cap_overflow`'s message), a following `__rmc_str_new` assembled
 into `.rodata` and faulted at run time under `as`+`ld` because the section is not
 executable (the in-process encoder did not, masking it). The
 `every_piece_names_its_own_section` test in `runtime.rs` pins the invariant.
+
+## Run-time code quality, second round (November 2026)
+
+The rules below came out of closing the run-time gap on the held-out
+`bench/real` set. Each bold phrase is the one `AGENTS.md` uses.
+
+### Branches stay off 32-byte boundaries
+
+On the benchmark host (Intel, family 6 model 173) `heavy`'s loop ran in 2.17 s
+or 0.53 s depending only on where it landed. Two builds that differed in one
+register name (two bytes before the loop) were 4x apart; sweeping the loop's
+offset with `.nops` reproduced it at exactly the offset where the fused
+`cmp %r12,%rbx; jge` straddled a 32-byte boundary, and `as
+-mbranches-within-32B-boundaries` on the same file gave 0.53 s. `x86/elf.rs`
+records a pad point before every branch to a label (before the instruction it
+fuses with, when one immediately precedes it with no label or directive in
+between) and the relaxation fixpoint sizes the pad like a `.p2align`. Labels
+stay before the pad, as in GNU `as`. The lengthening loop runs to its
+fixpoint because a lengthened branch moves the padding after it. `--binutils`
+passes `-malign-branch-boundary=32 -malign-branch=jcc+fused+jmp
+-malign-branch-prefix-size=0` so the two link paths lay hot code out alike.
+
+### A branch on a comparison uses the operands' kind
+
+`jcc()` mapped `<`/`<=`/`>`/`>=` to the signed jumps for every type, and a
+float comparison folded into a branch was an integer `cmp` of the bit
+patterns. So `idx < len` on `usize` passed for `-1 as usize` (a read before
+the array instead of a panic), every comparison of negative floats was
+inverted, and `NaN < x` was true. The materialised `bool` was already right,
+which is why only branches showed it. Unsigned or pointer operands now pick
+`jb`/`jbe`/`ja`/`jae` (either side decides: a constant operand reads as
+`i64`), and a float comparison is never folded. Its `ucomisd` path needed
+`setp`/`setnp` in the in-process encoder, which had dispatched them to an
+`unreachable!`. `tests/mir/bigindex`, `tests/mir/cmpkinds`.
+
+### Register sharing needs every read in the liveness
+
+Promotion used to give each local a register of its own (nine at most). It
+now allocates through an interference graph, so locals whose lifetimes never
+overlap share a register, and every candidate (locals and wide constants)
+goes through one priority order weighted by uses x 8^loop-depth. That is only
+sound if liveness sees every read. Missing ones that broke real programs
+once registers were shared: `return` reads `_0`; an indirect call reads its
+callee (`fnptr` segfaulted); a written place reads its base and index locals
+(`real_vm` never terminated); a comparison folded into its terminator reads
+its operands *at* the terminator, so a later statement in the block must not
+take their register. Locals sharing a caller-saved register share its spill
+slot, so a spill saves the register once and a restore of a dead owner cannot
+land last.
+
+Two placement rules: an argument no call outlives may stay in its incoming
+register (the entry move becomes a no-op, which is the only way an argument
+can use a caller-saved register without clobbering a later one), and a local
+live across a call takes only a callee-saved register (a caller-saved one is
+saved and restored around each call, which measured slower than the frame
+slot for `nqueens`'s running count).
+
+Linear weights (depth + 1) let the counters of outer loops hold registers an
+inner loop needed; 8^depth fixed `bfs` (1.66x). A ranking by spill cost per
+live-range size (Chow and Hennessy) helped `life` and `matmul` but hurt `fib`
+and `sieve`; counting definitions as well as uses helped `life` and hurt
+`hashmap`. With nine registers and no live-range splitting, weights only move
+the loss around; splitting is the next lever (`ROADMAP.md`).
+
+### `coalesce_scratch` folds only copies out of a scratch register
+
+For `mov %a, %t` with exactly one scratch register, the pass renamed the
+non-scratch register to the scratch one over the following region and
+dropped the copy. That is right for a copy out of a scratch register (`mov
+%rax, %rbx`: the value is already in `%rax`) and wrong for a copy into one
+(`mov %r14, %rcx; imul %rcx`: the value is in `%r14`, so `imul %rcx` read
+garbage). It fired only when the source had no other mention in the body,
+which is exactly a hoisted constant loaded in the prologue: a loop computing
+`x % 1000003` returned garbage (`tests/std/hoisted_magic`, present since
+before the first audit). It surfaced when an experimental allocation hoisted
+constants into callee-saved registers more often. Running the suites and the
+fuzzer under unusual allocations is a cheap way to shake out bugs like it.
+
+### A dropped assertion rests only on facts that still hold
+
+`drop_redundant_asserts` removes `assert(i < LEN)` once it has proven `i` in
+`[0, M]` with `M < LEN`. A call writes its destination, but only statements
+killed facts, so `d = x & 15; d = get(v); t[d]` read `t[1005]`; a local whose
+address is taken changes through the pointer with no statement naming it, so
+`p = &mut d; *p = v; t[d]` did too; and `b = (x < LEN)` was not forgotten when
+`x` changed. All three were memory-unsafe reads where Rust panics
+(`tests/mir/stalefacts`). Separately, the overflow check `assert(!(d == -1 &&
+x == i64::MIN))` folded both comparisons into the branch and dropped their
+statements while rustc's GVN reused `x == i64::MIN` for a later division of
+the same `x`, which then read a `bool` that was never stored
+(`tests/std/fuzz_mir_21_33`).

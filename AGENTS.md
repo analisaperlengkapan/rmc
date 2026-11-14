@@ -172,6 +172,10 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
 * Operand width follows the register named; an unsuffixed `mov $imm, mem` is
   32-bit (as `as` does); ALU immediate-to-memory ops must carry a suffix.
 * `.p2align n` aligns to 2^n and pads executable sections with `nop`.
+* **Branches stay off 32-byte boundaries**: a `jmp`/`jcc`, or a `cmp`/`test`/
+  `add`/`sub`/`and`/`inc`/`dec` fused with the `jcc` after it, is padded so it
+  neither crosses nor ends on one (a straddling loop test cost 4x on the
+  benchmark host). `--binutils` passes `as` the same rule, `nop` padding only.
 * Two `PT_LOAD` segments (R+X, R+W); never a writable+executable segment.
 
 ### Runtime (`x86/runtime.rs`)
@@ -196,6 +200,19 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
 * `ArgumentType::Count(n)` is the niche layout `[0, n]`.
 * `black_box::<T>` for a one-word `T` is the runtime identity call.
 * No memory-to-memory `cmp`: load one side first.
+* **A branch on a comparison uses the operands' kind**: `jb`/`jbe`/`ja`/`jae`
+  when either side is unsigned or a pointer; a float comparison is never folded
+  into a branch (it goes through `ucomisd`, which handles NaN).
+* **Register sharing needs every read in the liveness**: `return` reads `_0`,
+  an indirect call its callee, a written place its base and index locals, a
+  folded comparison its operands at the terminator. Locals sharing a
+  caller-saved register share its spill slot. A local live across a call takes
+  only a callee-saved register.
+* **`coalesce_scratch` folds only copies out of a scratch register**; a copy
+  into one (`mov %r14, %rcx; imul %rcx`) must stay.
+* **A dropped assertion rests only on facts that still hold**: a call kills
+  its destination, no fact is kept about an address-taken local, and a folded
+  overflow check keeps its comparisons when another block reads them.
 * The dylib links one exact nightly (`backend/rust-toolchain.toml`); every
   harness reads the pin from there. Panic stubs are derived from `nm -u`, never
   hard-coded mangled names.
@@ -209,6 +226,8 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
   time equals its `hello` time has been constant-folded.
 * `heap`, `refs`, `callrec` are the cases most sensitive to the generated code;
   near-parity programs flip sign between hosts.
+* A run under ~5 ms (`fib`, `stats`, `light`, `heap`) moves by 5-15% with code
+  placement alone; compare such programs on many repetitions, interleaved.
 
 ## Git workflow
 

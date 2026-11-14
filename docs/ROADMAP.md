@@ -38,8 +38,13 @@ Done:
 Next:
 
 * run the MIR fuzzer with `--keep` on a schedule and add each finding as a case;
-* extend `--mode mir` to structs passed by value, enums, nested arrays and
-  `u8`/`i32` arithmetic, the next shapes most likely to hide a miscompile;
+* extend `--mode mir` to **unsigned and float** values (it generates only
+  `i64`, which is why it never found the signed-branch and float-branch
+  miscompiles `tests/mir/cmpkinds` now covers), then structs passed by value,
+  enums, nested arrays and `u8`/`i32` arithmetic;
+* a stress mode that runs the suites and the fuzzer under deliberately unusual
+  register allocations: one such experiment exposed the `coalesce_scratch`
+  miscompile, which ordinary allocations hid;
 * an encoding oracle (`--encoding`, as the AST route has) for the MIR route.
 
 ## 2. The MIR route's architecture (the largest single lever)
@@ -84,19 +89,35 @@ slot per element) removes the frame-size limit `check_frame_sizes` enforces.
 
 ## 4. Run-time code quality
 
-Measured on the held-out `real` set, where rmc's code is clearly behind LLVM:
+Measured on the held-out `real` set, where rmc's code is behind LLVM. Done in
+the second round (`AUDIT.md`, section 9): an interference-based register
+allocator with one priority order, arguments kept in their incoming
+registers, branch alignment off 32-byte boundaries, immediate shift counts,
+one-instruction element addressing through pointers, out-of-line bounds-check
+failure paths. Next, in expected order of payoff:
 
-* a register allocator that uses caller-saved registers in call-free regions
-  (locals currently compete for five callee-saved registers, and loop-carried
-  values live in memory);
+* **live-range splitting**. With nine allocatable registers, a value live
+  through an inner loop it never touches (an outer counter) still holds its
+  register there. Splitting it around the loop (store before, reload after)
+  frees the register for the loop's temporaries. Re-weighting cannot do this:
+  three weightings were measured and each moved the loss between programs
+  (`design-notes.md`, "Register sharing").
+* **more allocatable registers**. `%r10`/`%r11` are scratch for division,
+  block copies and the return buffer, and several peepholes assume they are
+  free; freeing them per function needs those lowerings and the peepholes'
+  `SCRATCH` lists to agree.
+* **bounds-check elimination by range analysis**. A version that bounds
+  `(y & 127) * 128 + (x & 127)` and signed counters under `while x < N`
+  removed every check in `life`, but ran slower: the index lost its second use
+  and with it its register. It should land together with splitting; the
+  soundness half (stale facts) is already in.
 * if-conversion to `cmov` for data-dependent branches, with a heuristic that
-  keeps a predictable branch (both directions were measured: `light` wants
-  `cmov`, `heavy` does not);
+  keeps a predictable branch;
 * induction-variable strength reduction, generalising the single-pattern
-  `close_counted_loops` so it is not tuned to one benchmark;
-* bounds-check elimination and loop versioning.
+  `close_counted_loops`.
 
-Judge every change on `real`, not only on `core`.
+Judge every change on `real`, not only on `core`, with many interleaved
+repetitions: programs under ~5 ms move 5-15% with code placement alone.
 
 ## 5. Compile time at scale
 
