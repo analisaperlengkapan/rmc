@@ -125,6 +125,15 @@ struct FnGen<'a> {
     /// spilled around a call only when it is live after it, so a value that is
     /// dead (or not yet defined) at the call costs no store/reload pair.
     live_in: Vec<HashSet<u32>>,
+    /// Locals that may not share a register with another local: their address
+    /// is taken, so a later read through the pointer expects the value to stay.
+    no_share: HashSet<u32>,
+    /// Interference: for each local, the locals live at the same time (or read
+    /// by the statement that defines it). Two locals that do not interfere may
+    /// hold the same register at different times.
+    interf: HashMap<u32, HashSet<u32>>,
+    /// Register -> the promoted locals assigned to it.
+    reg_owners: HashMap<&'static str, Vec<u32>>,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
     /// has revealed which slots the body actually touches.
     slot_map: Option<Vec<i64>>,
@@ -1253,6 +1262,9 @@ impl<'a> FnGen<'a> {
             const_spill: HashMap::new(),
             saved_regs: 0,
             live_in: Vec::new(),
+            no_share: HashSet::new(),
+            interf: HashMap::new(),
+            reg_owners: HashMap::new(),
             slot_map: None,
             next_slot: 0,
             pinned: Vec::new(),
@@ -1513,6 +1525,7 @@ impl<'a> FnGen<'a> {
         let mut projected: HashSet<u32> = HashSet::new();
         let mut addr_taken: HashSet<u32> = HashSet::new();
         let mut index_locals: HashSet<u32> = HashSet::new();
+        let mut in_loop: HashSet<u32> = HashSet::new();
         for (bi, b) in self.func.blocks.iter().enumerate() {
             let w = depths.get(bi).copied().unwrap_or(0) + 1;
             let mut local_counts: HashMap<u32, u32> = HashMap::new();
@@ -1528,6 +1541,9 @@ impl<'a> FnGen<'a> {
             for (l, c) in local_counts {
                 *counts.entry(l).or_insert(0) += c;
                 *weighted.entry(l).or_insert(0) += c * w;
+                if w > 1 {
+                    in_loop.insert(l);
+                }
             }
         }
         let ranked: Vec<(u32, u32, u32)> = counts
@@ -1577,11 +1593,26 @@ impl<'a> FnGen<'a> {
         // running before the `bool` temps lets it claim the last register when
         // the loop has no room otherwise.
         self.hoist_consts(&mut used);
-        for (l, _, _) in bool_temps {
+        for (l, _, _) in bool_temps.iter().copied() {
             if self.promo.len() >= pool.len() {
                 break;
             }
             self.promote_local(l, &mut used);
+        }
+        // Phase B: every remaining scalar local that is not projected or
+        // address-taken, hottest first, shares a register with locals it never
+        // overlaps. The exclusive assignment above is unchanged, so this only
+        // adds registers where a value used to live in the frame.
+        let mut rest: Vec<(u32, u32)> = weighted
+            .iter()
+            .filter(|(l, _)| !self.promo.contains_key(l))
+            .filter(|(l, _)| !projected.contains(l) && !addr_taken.contains(l))
+            .map(|(l, w)| (*l, *w))
+            .collect();
+        rest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let crossers = self.call_crossers();
+        for (l, _) in rest {
+            self.promote_shared(l, crossers.contains(&l), in_loop.contains(&l));
         }
     }
 
@@ -1709,18 +1740,24 @@ impl<'a> FnGen<'a> {
                         }
                     }
                     // A destination with a projection only writes part of the
-                    // local, so the local stays live; treat it as a use as well.
+                    // local (or writes through it), so the local stays live; it
+                    // and any index local in the projection are reads.
                     if p.proj.is_empty() {
                         d.insert(p.local);
                     } else {
-                        if !d.contains(&p.local) {
-                            u.insert(p.local);
+                        let mut r: HashSet<u32> = HashSet::new();
+                        written_place_reads(p, &mut r);
+                        for l in r {
+                            if !d.contains(&l) {
+                                u.insert(l);
+                            }
                         }
                     }
                 }
             }
             let mut r: HashSet<u32> = HashSet::new();
             scan_term_uses(&b.term, &mut r);
+            term_extra_reads(&b.term, &mut r);
             for l in r {
                 if !d.contains(&l) {
                     u.insert(l);
@@ -1758,6 +1795,174 @@ impl<'a> FnGen<'a> {
             }
         }
         self.live_in = live_in;
+    }
+
+    /// Build the interference relation from statement-level liveness.
+    ///
+    /// Walking each block backwards from its live-out set, a definition of `d`
+    /// interferes with every local live after it *and* with every local the
+    /// defining statement reads (so a statement that writes its destination
+    /// register before reading an operand can never clobber that operand). The
+    /// operands of a comparison that `compare_branch_skip` folds into the
+    /// terminator are treated as read at the terminator, where the fold
+    /// evaluates them. The arguments are all defined at entry.
+    fn compute_interference(&mut self) {
+        let n = self.func.blocks.len();
+        let mut interf: HashMap<u32, HashSet<u32>> = HashMap::new();
+        let edge = |a: u32, b: u32, m: &mut HashMap<u32, HashSet<u32>>| {
+            if a != b {
+                m.entry(a).or_default().insert(b);
+                m.entry(b).or_default().insert(a);
+            }
+        };
+        for b in &self.func.blocks {
+            let mut live: HashSet<u32> = HashSet::new();
+            for sc in successors(&b.term) {
+                if (sc as usize) < n {
+                    live.extend(self.live_in[sc as usize].iter().copied());
+                }
+            }
+            // Terminator.
+            let mut tu: HashSet<u32> = HashSet::new();
+            scan_term_uses(&b.term, &mut tu);
+            term_extra_reads(&b.term, &mut tu);
+            if matches!(b.term, Terminator::SwitchInt { .. } | Terminator::Assert { .. }) {
+                for st in &b.stmts {
+                    if let Stmt::Assign(_, rv @ Rvalue::Binary(..)) = st {
+                        scan_rv_uses(rv, &mut tu);
+                    }
+                }
+            }
+            if let Terminator::Call { dest, .. } = &b.term {
+                if dest.proj.is_empty() {
+                    for &o in live.iter().chain(tu.iter()) {
+                        edge(dest.local, o, &mut interf);
+                    }
+                    live.remove(&dest.local);
+                }
+            }
+            live.extend(tu.iter().copied());
+            // Statements, last to first.
+            for st in b.stmts.iter().rev() {
+                let Stmt::Assign(p, rv) = st else { continue };
+                let mut su: HashSet<u32> = HashSet::new();
+                scan_rv_uses(rv, &mut su);
+                if p.proj.is_empty() {
+                    for &o in live.iter().chain(su.iter()) {
+                        edge(p.local, o, &mut interf);
+                    }
+                    live.remove(&p.local);
+                } else {
+                    written_place_reads(p, &mut su);
+                }
+                if let Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } = rv {
+                    self.no_share.insert(place.local);
+                }
+                live.extend(su);
+            }
+        }
+        // Every argument is written at entry, together.
+        let args: Vec<u32> = (0..self.func.locals.len() as u32)
+            .filter(|l| self.func.locals[*l as usize].is_arg)
+            .collect();
+        let entry_live: Vec<u32> = self.live_in.first().map(|s| s.iter().copied().collect()).unwrap_or_default();
+        for &a in &args {
+            for &o in args.iter().chain(entry_live.iter()) {
+                edge(a, o, &mut interf);
+            }
+        }
+        self.interf = interf;
+    }
+
+    /// The locals live across a call or a destructor: a caller-saved register
+    /// holding one is saved and restored around it.
+    fn call_crossers(&self) -> HashSet<u32> {
+        let mut out = HashSet::new();
+        for b in &self.func.blocks {
+            let (target, dest) = match &b.term {
+                Terminator::Call { target, dest, .. } => (*target, Some(dest)),
+                Terminator::Drop { target, .. } => (Some(*target), None),
+                _ => continue,
+            };
+            let Some(t) = target else { continue };
+            if let Some(live) = self.live_in.get(t as usize) {
+                for &l in live {
+                    if dest.map(|d| d.local == l && d.proj.is_empty()).unwrap_or(false) {
+                        continue;
+                    }
+                    out.insert(l);
+                }
+            }
+        }
+        out
+    }
+
+    /// Promote `local` into a register it can share: one whose current owners
+    /// are never live at the same time as `local`. Registers holding a hoisted
+    /// constant are never shared. Returns whether a register was found.
+    ///
+    /// The order of preference keeps the cost of the register below the cost of
+    /// the frame slot it replaces. A callee-saved register costs a push and a
+    /// pop per call of the function the first time it is used, and nothing
+    /// after; a caller-saved one costs a save and a restore around every call
+    /// the local is live across. So a local live across a call prefers a
+    /// callee-saved register the function already saves, and a local that is
+    /// not prefers a caller-saved register. A callee-saved register nobody
+    /// uses yet is taken only for a local used in a loop, where the per-call
+    /// push/pop is paid back; a recursive function's one-shot temporaries
+    /// otherwise turn every call into extra pushes (`fib`).
+    fn promote_shared(&mut self, local: u32, crosses_call: bool, in_loop: bool) -> bool {
+        if self.promo.contains_key(&local) || self.no_share.contains(&local) {
+            return false;
+        }
+        let ty = self.ty.get(local as usize).cloned().unwrap_or(Ty::I64);
+        if ty.is_aggregate() {
+            return false;
+        }
+        let is_arg = self.func.locals.get(local as usize).map(|l| l.is_arg).unwrap_or(false);
+        let callee_used: Vec<&'static str> = PROMOTE_REGS
+            .iter()
+            .copied()
+            .filter(|r| {
+                self.reg_owners.get(r).map(|v| !v.is_empty()).unwrap_or(false)
+                    || self.const_regs.values().any(|c| c == r)
+            })
+            .collect();
+        let callee_fresh: Vec<&'static str> = if in_loop {
+            PROMOTE_REGS.iter().copied().filter(|r| !callee_used.contains(r)).collect()
+        } else {
+            Vec::new()
+        };
+        let mut pool: Vec<&'static str> = Vec::new();
+        if is_arg {
+            pool.extend(&callee_used);
+            pool.extend(&callee_fresh);
+        } else if crosses_call {
+            pool.extend(&callee_used);
+            pool.extend(&callee_fresh);
+            pool.extend_from_slice(&CALLER_REGS);
+        } else {
+            pool.extend_from_slice(&CALLER_REGS);
+            pool.extend(&callee_used);
+            pool.extend(&callee_fresh);
+        }
+        let empty = HashSet::new();
+        let mine = self.interf.get(&local).unwrap_or(&empty);
+        for reg in pool {
+            if self.const_regs.values().any(|r| *r == reg)
+                || self.const_caller_regs.values().any(|r| *r == reg)
+            {
+                continue;
+            }
+            let owners = self.reg_owners.get(reg).map(|v| v.as_slice()).unwrap_or(&[]);
+            if owners.iter().any(|o| self.no_share.contains(o) || mine.contains(o)) {
+                continue;
+            }
+            self.reg_owners.entry(reg).or_default().push(local);
+            self.promo.insert(local, Promo { reg, caller_saved: CALLER_REGS.contains(&reg) });
+            return true;
+        }
+        false
     }
 
     /// Whether `local` is live after a call in `bb`: that is, whether the
@@ -1803,6 +2008,7 @@ impl<'a> FnGen<'a> {
         };
         used.insert(reg);
         let caller_saved = CALLER_REGS.contains(&reg);
+        self.reg_owners.entry(reg).or_default().push(local);
         self.promo.insert(local, Promo { reg, caller_saved });
     }
 
@@ -1895,8 +2101,9 @@ impl<'a> FnGen<'a> {
 
     fn gen_fn(&mut self) -> Result<String, String> {
         self.analyze();
-        self.plan_promotion();
         self.compute_liveness();
+        self.compute_interference();
+        self.plan_promotion();
         // A function that returns an aggregate receives a hidden pointer to the
         // caller's return place in `%rdi` and stores `_0` through it. The
         // address lives in a frame slot for the whole call, so it must be taken
@@ -1913,10 +2120,23 @@ impl<'a> FnGen<'a> {
                 self.shadow.insert(l, s);
             }
         }
-        // A promoted caller-saved local needs a home across a call.
+        // A promoted caller-saved local needs a home across a call. Locals that
+        // share a register share the home: a spill saves the register, whichever
+        // of its owners is live, and a read inside a destructor tree (which
+        // reads the home, see `local_operand`) then finds that value.
+        let mut reg_slot: HashMap<&'static str, i64> = HashMap::new();
         for l in 0..self.func.locals.len() as u32 {
-            if self.promo.get(&l).map(|p| p.caller_saved).unwrap_or(false) {
-                let s = self.alloc_slot();
+            let Some(p) = self.promo.get(&l) else { continue };
+            if p.caller_saved {
+                let reg = p.reg;
+                let s = match reg_slot.get(reg) {
+                    Some(s) => *s,
+                    None => {
+                        let s = self.alloc_slot();
+                        reg_slot.insert(reg, s);
+                        s
+                    }
+                };
                 self.caller_spill.insert(l, s);
             }
         }
@@ -4536,6 +4756,10 @@ impl<'a> FnGen<'a> {
         if let Some(bb) = bb {
             caller_promos.retain(|(l, _)| self.live_across_call(bb, *l));
         }
+        // Locals sharing a register share its spill slot: save and restore
+        // each register once, or a restore of a dead owner could land last.
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        caller_promos.retain(|(_, r)| seen.insert(*r));
         for (l, reg) in &caller_promos {
             let slot = self.off(self.caller_spill[l]);
             self.emit(&format!("  mov {reg}, {slot}"));
@@ -6772,6 +6996,51 @@ fn scan_rv_uses(rv: &Rvalue, out: &mut HashSet<u32>) {
         | Rvalue::Len(place)
         | Rvalue::Discriminant(place) => add_place(place, out),
         Rvalue::Unsupported(_) => {}
+    }
+}
+
+/// The locals a *written* place reads: the base, when the place projects into
+/// it or through it (a partial write keeps the rest live; a `Deref` reads the
+/// pointer), and every dynamic index local.
+fn written_place_reads(p: &Place, out: &mut HashSet<u32>) {
+    if p.proj.is_empty() {
+        return;
+    }
+    out.insert(p.local);
+    for proj in &p.proj {
+        if let Proj::IndexLocal(i) = proj {
+            out.insert(*i);
+        }
+    }
+}
+
+/// Reads a terminator makes that `scan_term_uses` does not report: `return`
+/// reads `_0`, an indirect call reads its callee, a call into a projected
+/// place reads that place's base and indices, and a drop reads its indices.
+fn term_extra_reads(t: &Terminator, out: &mut HashSet<u32>) {
+    match t {
+        Terminator::Return => {
+            out.insert(0);
+        }
+        Terminator::Call { dest, func, .. } => {
+            if let Some(Operand::Copy(p) | Operand::Move(p)) = call_callee(func) {
+                out.insert(p.local);
+                for proj in &p.proj {
+                    if let Proj::IndexLocal(i) = proj {
+                        out.insert(*i);
+                    }
+                }
+            }
+            written_place_reads(dest, out);
+        }
+        Terminator::Drop { place, .. } => {
+            for proj in &place.proj {
+                if let Proj::IndexLocal(i) = proj {
+                    out.insert(*i);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

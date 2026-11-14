@@ -29,6 +29,7 @@ OUT = "/tmp/rmcmirtests"
 # argv vectors per case. Each vector is one run; the case passes only if every
 # run matches. A case with no entry runs once with no arguments.
 ARGS = {
+    "regshare": [["5", "3"], ["-4", "9"], ["0", "0"]],
     "cmp": [["-5"], ["0"], ["7"]],
     "forloop": [["6"], ["0"]],
     "calls": [["10", "20", "30"]],
