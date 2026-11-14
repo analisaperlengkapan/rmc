@@ -55,9 +55,20 @@ ARGS = {
     # ovfcheck runs with overflow checks on: the first vector is in range, the
     # second overflows the add and must exit 101 on both binaries.
     "ovfcheck": [["2", "3"], ["9223372036854775807", "1"]],
+    # A constant on the left of `-`: small, negative, zero and extreme operands,
+    # and a loop count (the second argument) of zero, one and several.
+    "constleft": [["6", "0"], ["-6", "1"], ["0", "5"], ["9223372036854775807", "3"],
+                  ["-9223372036854775808", "2"]],
+    # With overflow checks: `5 - i64::MIN` overflows and must exit 101 on both
+    # sides; `5 - 6` must not.
+    "constleftovf": [["6"], ["-9223372036854775808"], ["-9223372036854775807"]],
     # srread reads its loop bounds from argv, so run zero, one and several
     # iterations to catch the off-by-one the strength-reduce guard prevents.
     "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
+    # The counted-loop closure: zero, one, negative and large trip counts for
+    # each of the three bounds, so the zero-trip guard and the fold are both hit.
+    "loopcount": [["0", "0", "0"], ["1", "1", "1"], ["5", "-3", "9"], ["1000", "7", "-1"]],
+    "loopneg": [["0"], ["1"], ["6"], ["-4"]],
     # float accumulates `n` half-steps; run the empty and non-empty loops.
     "float": [["0"], ["1"], ["5"], ["9"]],
     # resenum builds a `Result` at runtime: n > 0 takes `Ok`, n <= 0 takes
