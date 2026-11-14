@@ -6305,12 +6305,25 @@ struct AssertFacts {
 impl Function {
     fn drop_redundant_asserts(&mut self) {
         let n = self.blocks.len();
+        // A local whose address is taken can change through the pointer
+        // without a statement naming it, so no fact is ever recorded about it.
+        let escaped = self.escaped_locals();
         let mut facts_in: Vec<Option<AssertFacts>> = vec![None; n];
         facts_in[0] = Some(AssertFacts::default());
         loop {
             let mut changed = false;
             for b in 0..n {
-                let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b]) else { continue };
+                let Some(mut facts) = facts_at_term(&self.blocks[b], &facts_in[b], &escaped)
+                else {
+                    continue;
+                };
+                // A call writes its destination when it returns, so nothing
+                // known about the old value holds on the edge to `target`.
+                if let Terminator::Call { dest, .. } = &self.blocks[b].term {
+                    if dest.proj.is_empty() {
+                        facts.kill(dest.local);
+                    }
+                }
                 for (s, edge) in edges_with_facts(&self.blocks[b].term) {
                     let s = s as usize;
                     let mut contributed = facts.clone();
@@ -6344,7 +6357,9 @@ impl Function {
         // The `bool` is defined by a statement in the same block, so the block's
         // statements are replayed onto the entry state first.
         for b in 0..n {
-            let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b]) else { continue };
+            let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b], &escaped) else {
+                continue;
+            };
             let Terminator::Assert { cond, negate, target } = &self.blocks[b].term else {
                 continue;
             };
@@ -6380,6 +6395,22 @@ impl Function {
         // and the backend would still materialise it. Remove assignments to a
         // whole local nothing reads, when the rvalue is free of side effects.
         self.drop_dead_pure_assignments();
+    }
+
+    /// Locals whose address is taken anywhere in the function (`&x`, `&mut x`,
+    /// `&raw x`, or a borrow of a part of `x`).
+    fn escaped_locals(&self) -> HashSet<u32> {
+        let mut out = HashSet::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(_, Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. }) = s {
+                    if !matches!(place.proj.first(), Some(Proj::Deref)) {
+                        out.insert(place.local);
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn drop_dead_pure_assignments(&mut self) {
@@ -6447,6 +6478,8 @@ impl AssertFacts {
         self.iszero.retain(|_, v| *v != l);
         self.masked.remove(&l);
         self.lt.remove(&l);
+        // `b = (x < LEN)` says nothing once `x` changes.
+        self.lt.retain(|_, (x, _)| *x != l);
     }
 
     fn intersect(&self, other: &AssertFacts) -> AssertFacts {
@@ -6487,7 +6520,11 @@ impl AssertFacts {
 
 /// The facts after a block's statements run, given its entry facts. `None` when
 /// the block is unreachable (no entry facts have reached it yet).
-fn facts_at_term(block: &BasicBlock, entry: &Option<AssertFacts>) -> Option<AssertFacts> {
+fn facts_at_term(
+    block: &BasicBlock,
+    entry: &Option<AssertFacts>,
+    escaped: &HashSet<u32>,
+) -> Option<AssertFacts> {
     let mut facts = entry.clone()?;
     // Locals written later in the block: an alias to one of them is not valid
     // by the time the terminator runs.
@@ -6505,7 +6542,10 @@ fn facts_at_term(block: &BasicBlock, entry: &Option<AssertFacts>) -> Option<Asse
             later_writes.remove(&l);
         }
         if let Stmt::Assign(d, rv) = s {
-            if d.proj.is_empty() {
+            // Facts are recorded only about locals that cannot change behind
+            // the analysis's back, and only from operands that cannot either.
+            let reads: HashSet<u32> = rv_operands(rv).iter().map(|p| p.local).collect();
+            if d.proj.is_empty() && !escaped.contains(&d.local) && reads.is_disjoint(escaped) {
                 match rv {
                     Rvalue::Use(Operand::Const(Const::Int(v))) => {
                         if *v == 0 {
@@ -7461,6 +7501,75 @@ fn main() -> () {
             !format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
             "the bounds check on `i & 255` against a length of 256 is redundant"
         );
+    }
+
+    fn has_assert(prog: &Program) -> bool {
+        prog.funcs[0].blocks.iter().any(|b| matches!(b.term, Terminator::Assert { .. }))
+    }
+
+    /// A call's result replaces whatever was known about its destination: the
+    /// bound from `_2 = _1 & 15` must not survive `_2 = f()`.
+    #[test]
+    fn a_call_result_is_not_bounded_by_the_old_value() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: i64;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {
+        _2 = BitAnd(copy _1, const 15_i64);
+        _2 = arg_i64(const 1_i64) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _3 = copy _2 as usize (IntToInt);
+        _4 = Lt(copy _3, const 16_usize);
+        assert(move _4, \"index out of bounds\") -> [success: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(has_assert(&prog), "the call may return anything");
+    }
+
+    /// A local whose address is taken can change through the pointer, so no
+    /// bound is recorded for it.
+    #[test]
+    fn an_escaped_local_is_not_bounded() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: i64;
+    let mut _3: &mut i64;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = BitAnd(copy _1, const 15_i64);
+        _3 = &mut _2;
+        (*_3) = const 1000_i64;
+        _4 = copy _2 as usize (IntToInt);
+        _5 = Lt(copy _4, const 16_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(has_assert(&prog), "_2 is 1000 when the check runs");
     }
 
     #[test]
