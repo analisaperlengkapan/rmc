@@ -3559,6 +3559,21 @@ __rmc_umax:
     Piece {
         text: r#"
 .text
+# long __rmc_black_box(long x)  -- `std::hint::black_box` for a one-word value.
+# It returns its argument, but as a real call the optimiser cannot see through
+# it, which is the whole point of `black_box`: a benchmark's input stays opaque.
+.globl __rmc_black_box
+.type __rmc_black_box, @function
+__rmc_black_box:
+    mov %rdi, %rax
+    ret
+.size __rmc_black_box, .-__rmc_black_box
+"#,
+        defines: &["__rmc_black_box"],
+    },
+    Piece {
+        text: r#"
+.text
 # long __rmc_wrapping_add(long a, long b)  -- two's complement wrapping,
 # identical to the bare `add` the operator path emits. It exists so
 # `a.wrapping_add(b)` has the same operand evaluation (left to right, each once)

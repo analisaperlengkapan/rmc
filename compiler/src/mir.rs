@@ -2239,6 +2239,15 @@ fn is_panic_fn(name: &str) -> bool {
 /// final path segment, `min`, which is not a symbol the runtime defines).
 fn std_intrinsic_name(name: &str) -> Option<String> {
     let n = name.trim();
+    // `core::intrinsics::black_box::<T>` (what `std::hint::black_box` inlines
+    // to) for a one-word `T`: the runtime's identity call keeps the value
+    // opaque. An aggregate `T` travels by hidden pointer, which an identity
+    // call cannot model, so it stays unsupported.
+    if let Some(ty) = black_box_arg_ty(n) {
+        if is_word_ty_text(ty) {
+            return Some("__rmc_black_box".to_string());
+        }
+    }
     // `<[u8]>::starts_with`/`ends_with` — the byte-slice predicates `str`'s
     // `starts_with`/`ends_with` inline to. rmc's `&[u8]` (and the `&[u8]` cast
     // of a string literal) is the address of a `{len: i64, bytes..}` record, so
@@ -2279,6 +2288,30 @@ fn std_intrinsic_name(name: &str) -> Option<String> {
         return Some(format!("__rmc_{kind}{method}"));
     }
     None
+}
+
+/// The `T` of `core::intrinsics::black_box::<T>` / `std::intrinsics::...`.
+fn black_box_arg_ty(n: &str) -> Option<&str> {
+    let rest = n
+        .strip_prefix("core::intrinsics::black_box::<")
+        .or_else(|| n.strip_prefix("std::intrinsics::black_box::<"))
+        .or_else(|| n.strip_prefix("core::hint::black_box::<"))
+        .or_else(|| n.strip_prefix("std::hint::black_box::<"))?;
+    rest.strip_suffix('>')
+}
+
+/// Whether a printed MIR type fits one register: an integer, `bool`, `char`,
+/// or a thin pointer/reference to a sized type.
+fn is_word_ty_text(t: &str) -> bool {
+    let t = t.trim();
+    matches!(
+        t,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+            | "bool" | "char"
+    ) || ((t.starts_with('&') || t.starts_with("*const ") || t.starts_with("*mut "))
+        && !t.contains("str")
+        && !t.contains('[')
+        && !t.contains("dyn "))
 }
 
 /// See the call site in [`std_intrinsic_name`].
