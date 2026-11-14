@@ -1834,7 +1834,11 @@ impl Elf {
             "setno" => 0x91,
             "sets" => 0x98,
             "setns" => 0x99,
-            _ => unreachable!(),
+            // The parity flag is set by an unordered `ucomisd` (a NaN operand),
+            // so the float comparisons guard with these.
+            "setp" => 0x9A,
+            "setnp" => 0x9B,
+            other => return Err(format!("elf: unsupported `{other}`")),
         };
         let (reg, _) = parse_reg(&ops[0])?;
         if reg >= 8 {
@@ -2461,6 +2465,14 @@ mod tests {
         let mut e = test_elf(0x5);
         e.instruction(line, 0).expect("encodes");
         e.sections[0].data[3..].to_vec()
+    }
+
+    #[test]
+    fn setp_and_setnp_encode() {
+        // `ucomisd` sets PF for an unordered (NaN) comparison; the float
+        // comparison lowering tests it with these two.
+        assert_eq!(encode_one("setp %cl"), [0x0F, 0x9A, 0xC1]);
+        assert_eq!(encode_one("setnp %al"), [0x0F, 0x9B, 0xC0]);
     }
 
     #[test]

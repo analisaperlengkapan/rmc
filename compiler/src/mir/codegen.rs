@@ -2443,6 +2443,11 @@ impl<'a> FnGen<'a> {
             }
         }
         let Some(i) = last else { return Vec::new() };
+        if let Stmt::Assign(_, Rvalue::Binary(_, a, b)) = &block.stmts[i] {
+            if self.cmp_float(a, b) {
+                return Vec::new();
+            }
+        }
         // Folding the comparison into the terminator leaves no `bool` in
         // memory, so a *later* block that reads the same local (rustc reuses
         // one `_15` for both the first and a second bounds check) would read a
@@ -2562,9 +2567,30 @@ impl<'a> FnGen<'a> {
             }
             None
         };
-        let (c1i, _, _, _) = cmp_of(xp.local)?;
-        let (c2i, _, _, _) = cmp_of(yp.local)?;
+        let (c1i, _, a1, b1) = cmp_of(xp.local)?;
+        let (c2i, _, a2, b2) = cmp_of(yp.local)?;
+        // `and_chain_cmps` refuses a float pair, so the terminator will not
+        // fold it; its statements must stay.
+        if self.cmp_float(&a1, &b1) || self.cmp_float(&a2, &b2) {
+            return None;
+        }
         Some((ai, c1i, c2i))
+    }
+
+    /// Whether a comparison of `a` with `b` is unsigned: either operand an
+    /// unsigned integer or a pointer. Both sides have one type in MIR, but a
+    /// constant operand reads as `i64` here, so either side decides.
+    fn cmp_unsigned(&self, a: &Operand, b: &Operand) -> bool {
+        let u = |t: Ty| t.is_unsigned() || matches!(t, Ty::Ref(_) | Ty::Ptr(_));
+        u(self.operand_ty(a)) || u(self.operand_ty(b))
+    }
+
+    /// Whether a comparison is between floats. An integer `cmp` of the bit
+    /// patterns is wrong for negative values and for NaN, so a float
+    /// comparison is never folded into a branch; it is materialised by the
+    /// `ucomisd` path, which handles both, and the branch tests the `bool`.
+    fn cmp_float(&self, a: &Operand, b: &Operand) -> bool {
+        self.operand_ty(a).is_float() || self.operand_ty(b).is_float()
     }
 
     /// The two comparisons behind an `assert(!(c1 && c2))` terminator, as
@@ -2594,13 +2620,21 @@ impl<'a> FnGen<'a> {
             }
             None
         };
-        Some((cmp_of(xp.local)?, cmp_of(yp.local)?))
+        let (c1, c2) = (cmp_of(xp.local)?, cmp_of(yp.local)?);
+        if self.cmp_float(&c1.1, &c1.2) || self.cmp_float(&c2.1, &c2.2) {
+            return None;
+        }
+        Some((c1, c2))
     }
 
     /// Emit the `cmp` for the comparison that produced `cond` in `bb`, when
     /// there is one, and return the comparison's operator. `None` when `cond`
     /// is not a just-computed compare.
-    fn emit_fused_compare(&mut self, bb: u32, cond: &Operand) -> Result<Option<BinOp>, String> {
+    fn emit_fused_compare(
+        &mut self,
+        bb: u32,
+        cond: &Operand,
+    ) -> Result<Option<(BinOp, bool)>, String> {
         let Some(pl) = operand_place(cond) else { return Ok(None) };
         if !pl.proj.is_empty() {
             return Ok(None);
@@ -2615,8 +2649,11 @@ impl<'a> FnGen<'a> {
             }
         }
         let Some((op, a, b)) = cmp else { return Ok(None) };
+        if self.cmp_float(&a, &b) {
+            return Ok(None);
+        }
         self.emit_cmp(op, &a, &b)?;
-        Ok(Some(op))
+        Ok(Some((op, self.cmp_unsigned(&a, &b))))
     }
 
     fn gen_term(&mut self, bb: u32, term: &Terminator) -> Result<(), String> {
@@ -2670,10 +2707,12 @@ impl<'a> FnGen<'a> {
                         if pl.proj.is_empty() {
                             if let Some((c1, c2)) = self.and_chain_cmps(bb, pl.local) {
                                 let ok = self.new_label();
+                                let u1 = self.cmp_unsigned(&c1.1, &c1.2);
+                                let u2 = self.cmp_unsigned(&c2.1, &c2.2);
                                 self.emit_cmp(c1.0, &c1.1, &c1.2)?;
-                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c1.0))));
+                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c1.0), u1)));
                                 self.emit_cmp(c2.0, &c2.1, &c2.2)?;
-                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c2.0))));
+                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c2.0), u2)));
                                 self.emit("  mov $101, %rdi");
                                 self.emit("  mov $60, %rax");
                                 self.emit("  syscall");
@@ -2689,11 +2728,11 @@ impl<'a> FnGen<'a> {
                 // A `assert(cmp, ..)` folds the comparison into the flags, so
                 // the `bool` local is never materialised.
                 let jcc = match self.emit_fused_compare(bb, cond)? {
-                    Some(op) => {
+                    Some((op, u)) => {
                         // `assert(!cmp, ..)` succeeds when the comparison is
                         // false, so jump on the complement of the comparison.
                         let op = if *negate { negate_cc(op) } else { op };
-                        jcc(op)
+                        jcc(op, u)
                     }
                     None => {
                         // Otherwise evaluate the condition into `%rax` and test.
@@ -2805,6 +2844,10 @@ impl<'a> FnGen<'a> {
             }
         }
         let Some((op, a, b)) = cmp else { return Ok(false) };
+        if self.cmp_float(&a, &b) {
+            return Ok(false);
+        }
+        let u = self.cmp_unsigned(&a, &b);
         self.emit_cmp(op, &a, &b)?;
         // Jump to `taken` when the comparison holds, else to `fallthrough`.
         // Whichever arm is the next emitted block becomes the fall-through: when
@@ -2812,9 +2855,9 @@ impl<'a> FnGen<'a> {
         // that follows its header needs no jump at all.
         let next = bb + 1;
         if taken == next {
-            self.emit(&format!("  {} .Lbb{}", jcc(negate_cc(op)), self.bb_label(fallthrough)));
+            self.emit(&format!("  {} .Lbb{}", jcc(negate_cc(op), u), self.bb_label(fallthrough)));
         } else {
-            self.emit(&format!("  {} .Lbb{}", jcc(op), self.bb_label(taken)));
+            self.emit(&format!("  {} .Lbb{}", jcc(op, u), self.bb_label(taken)));
             if fallthrough != next || fallthrough as usize >= self.func.blocks.len() {
                 self.emit(&format!("  jmp .Lbb{}", self.bb_label(fallthrough)));
             }
@@ -4130,7 +4173,7 @@ impl<'a> FnGen<'a> {
                 // A `<`/`<=`/`>`/`>=` on an unsigned integer must compare with
                 // the carry flag (`setb`/`setbe`/`seta`/`setae`), not the sign
                 // flag, or a value with the top bit set reads as negative.
-                let cc = if self.operand_ty(a).is_unsigned() {
+                let cc = if self.cmp_unsigned(a, b) {
                     match op {
                         BinOp::Lt => "setb",
                         BinOp::Le => "setbe",
@@ -6929,14 +6972,22 @@ fn ovf_mnem(op: BinOp) -> &'static str {
     }
 }
 
-fn jcc(op: BinOp) -> &'static str {
-    match op {
-        BinOp::Eq => "je",
-        BinOp::Ne => "jne",
-        BinOp::Lt => "jl",
-        BinOp::Le => "jle",
-        BinOp::Gt => "jg",
-        BinOp::Ge => "jge",
+/// The conditional jump taken when `op` holds after `cmp b, a`. An unsigned
+/// (or pointer) comparison reads the carry flag (`jb`/`jbe`/`ja`/`jae`), a
+/// signed one the sign and overflow flags: `jl` on a `usize` index let
+/// `-1 as usize` pass a bounds check.
+fn jcc(op: BinOp, unsigned: bool) -> &'static str {
+    match (op, unsigned) {
+        (BinOp::Eq, _) => "je",
+        (BinOp::Ne, _) => "jne",
+        (BinOp::Lt, false) => "jl",
+        (BinOp::Le, false) => "jle",
+        (BinOp::Gt, false) => "jg",
+        (BinOp::Ge, false) => "jge",
+        (BinOp::Lt, true) => "jb",
+        (BinOp::Le, true) => "jbe",
+        (BinOp::Gt, true) => "ja",
+        (BinOp::Ge, true) => "jae",
         _ => "je",
     }
 }

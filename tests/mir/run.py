@@ -30,6 +30,8 @@ OUT = "/tmp/rmcmirtests"
 # run matches. A case with no entry runs once with no arguments.
 ARGS = {
     "regshare": [["5", "3"], ["-4", "9"], ["0", "0"]],
+    "bigindex": [["2"], ["-1"], ["6"]],
+    "cmpkinds": [["3"], ["9"], ["-5"], ["0"]],
     "cmp": [["-5"], ["0"], ["7"]],
     "forloop": [["6"], ["0"]],
     "calls": [["10", "20", "30"]],
