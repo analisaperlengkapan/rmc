@@ -1270,7 +1270,22 @@ impl<'a> FnGen<'a> {
 
     fn new_label(&mut self) -> String {
         self.label += 1;
-        format!(".Lrmc{}", self.label)
+        // The counter restarts in every function (both codegen passes must
+        // number identically), so the label carries the function's name like
+        // the block labels do. A bare `.Lrmc{n}` was defined once per function:
+        // GNU `as` rejected the file, and the in-process assembler resolved
+        // every jump to the *last* definition, so a loop in one function
+        // jumped into another (the `vm` and `textparse` segfaults).
+        format!(".Lrmc_{}_{}", self.label_tag(), self.label)
+    }
+
+    /// The function name, reduced to label-safe characters.
+    fn label_tag(&self) -> String {
+        self.func
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect()
     }
 
     fn alloc_slot(&mut self) -> i64 {
@@ -2131,15 +2146,7 @@ impl<'a> FnGen<'a> {
     /// different functions cannot collide (assembler-local `.L` labels share
     /// one namespace across the whole translation unit).
     fn bb_label(&self, bb: u32) -> String {
-        let mut f = String::with_capacity(self.func.name.len() + 8);
-        for c in self.func.name.chars() {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                f.push(c);
-            } else {
-                f.push('_');
-            }
-        }
-        format!("{f}_{bb}")
+        format!("{}_{bb}", self.label_tag())
     }
 
     fn gen_block(&mut self, bb: u32) -> Result<(), String> {

@@ -164,6 +164,13 @@ impl Elf {
                 let (name, rest) = line.split_at(i);
                 let name = name.trim();
                 if !name.is_empty() && !name.contains(char::is_whitespace) {
+                    // A second definition is an error, as in GNU `as`. Letting
+                    // it overwrite the first silently retargeted every branch to
+                    // that label, so two functions sharing a local label name
+                    // assembled into a binary that jumped across functions.
+                    if self.syms.contains_key(name) {
+                        return Err(format!("symbol `{name}` is already defined"));
+                    }
                     let off = self.sections[cur].data.len() as u64;
                     let ord = self.defs;
                     self.defs += 1;
@@ -2206,6 +2213,16 @@ fn emit_mem_modrm(out: &mut Vec<u8>, m: &Mem, reg: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A label defined twice is an error, as in GNU `as`. Overwriting the
+    /// first definition retargeted every branch to the second, so two
+    /// functions that both defined `.Lrmc1` jumped into each other.
+    #[test]
+    fn a_label_defined_twice_is_rejected() {
+        let asm = ".text\n.globl _start\n_start:\n.Lx:\n  ret\n.Lx:\n  ret\n";
+        let err = assemble(asm).expect_err("duplicate label accepted");
+        assert!(err.contains("already defined"), "{err}");
+    }
 
     fn mem(s: &str) -> Mem {
         parse_mem(s).expect("operand parses")
