@@ -2,9 +2,9 @@
 //!
 //! This module is the *front end adapter* of the `rmc` backend: rustc does the
 //! lexing, parsing, name resolution, type checking and MIR-level optimisation,
-//! and hands back a small, fully typed control-flow graph. The backend
-//! (`mir_codegen.rs`) then lowers that graph to x86-64, reusing `elf.rs` and
-//! `runtime.rs` unchanged.
+//! and hands back a small, fully typed control-flow graph. The lowering
+//! (`codegen`, re-exported as `crate::mir_codegen`) then turns that graph into
+//! x86-64, reusing `crate::x86::elf` and `crate::x86::runtime` unchanged.
 //!
 //! The parser reads the stable-ish "human consumers" text format. It is
 //! deliberately permissive about what it ignores: `debug` bindings, `scope`
@@ -13,6 +13,8 @@
 //! are skipped rather than modelled. Anything it does not recognise is a hard
 //! error naming the line, so an unhandled MIR shape fails loudly instead of
 //! silently miscompiling.
+
+pub mod codegen;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

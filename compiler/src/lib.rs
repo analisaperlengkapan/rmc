@@ -13,20 +13,21 @@
 //! assert!(asm.contains("main:"));
 //! ```
 
-pub mod ast;
-pub mod codegen;
-pub mod consts;
-pub mod dce;
-pub mod elf;
-pub mod inline;
-pub mod licm;
-pub mod lexer;
+// Source layout: `front` (rmc's own front end), `opt` (AST passes), `mir`
+// (the rustc-MIR route: parser, passes and lowering) and `x86` (the code
+// generator, runtime and in-process assembler/linker both routes share).
+pub mod front;
 pub mod mir;
-pub mod mir_codegen;
-pub mod parser;
-pub mod runtime;
-pub mod sema;
-pub mod tco;
+pub mod opt;
+pub mod x86;
+
+// The flat names every module (and the backend crate, the examples and the
+// tests) used before the split, kept so a path like `crate::ast::Expr` or
+// `rmc::mir_codegen::Options` still resolves.
+pub use front::{ast, consts, lexer, parser, sema};
+pub use mir::codegen as mir_codegen;
+pub use opt::{dce, inline, licm, tco};
+pub use x86::{codegen, elf, runtime};
 
 /// Options that change what the compiler emits.
 #[derive(Debug, Clone, Default)]
