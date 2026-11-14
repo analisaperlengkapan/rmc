@@ -1,11 +1,17 @@
-//! rmc: an ahead-of-time compiler for a small, statically-typed subset of Rust.
+//! rmc: an ahead-of-time compiler for a statically-typed subset of Rust.
 //!
-//! The pipeline is lex -> parse -> semantic analysis -> inline -> self-recursion
-//! to loop -> loop-invariant code motion -> x86-64 assembly. This library exposes it as a single call,
-//! [`compile_to_asm`], so rmc can be embedded in another program instead of only
-//! run as a command-line tool. The `rmc` binary in `src/main.rs` drives this
-//! library and then invokes `as` and `ld`; those two are the only external
-//! dependencies, and neither is needed if you only want the assembly text.
+//! Two routes share one x86-64 back end:
+//!
+//! * rmc's own front end ([`compile_to_asm`]): lex -> parse (with desugaring)
+//!   -> semantic analysis -> AST passes (inline, self-recursion to loop,
+//!   loop-invariant code motion, dead-function elimination) -> assembly;
+//! * rustc's front end ([`mir_text_to_asm`], used by `rmc --rustc-frontend`,
+//!   the `rmcmir` example and the `-Zcodegen-backend` dylib): rustc's MIR ->
+//!   [`optimize_mir`] -> assembly.
+//!
+//! Either way the result is a complete translation unit (program plus the
+//! freestanding runtime) that [`elf::assemble`] turns into a static ELF64
+//! executable in-process; GNU `as` and `ld` are needed only for `--binutils`.
 //!
 //! ```
 //! let asm = rmc::compile_to_asm("fn main() -> i64 { return 0; }", &Default::default())
