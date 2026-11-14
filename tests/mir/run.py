@@ -192,15 +192,23 @@ def build_reference(name, rt):
     return ref, None
 
 
-def build_rmc(name):
+def build_rmc(name, binutils=False):
+    """Build with rmc. `binutils` assembles with GNU `as` and links with `ld`
+    instead of the in-process encoder: the two must accept the same assembly
+    and produce binaries that behave identically. Label collisions and
+    width-ambiguous instructions (`cmp $k, mem`) each made them disagree."""
     src = os.path.join(ROOT, f"{name}.rs")
-    mir = os.path.join(OUT, f"{name}.mir.bin")
+    mir = os.path.join(OUT, f"{name}.{'bu' if binutils else 'mir'}.bin")
     argv = [RMC, "--rustc-frontend", src, "-o", mir]
     if overflow_checks(name):
         argv.insert(2, "--overflow-checks")
+    if binutils:
+        argv.insert(2, "--binutils")
     rc, _, err = run(argv)
     if rc != 0:
-        return None, f"rmc failed:\n{err.decode(errors='replace')}"
+        return None, f"rmc{' --binutils' if binutils else ''} failed:\n{err.decode(errors='replace')}"
+    if binutils and b"Warning" in err:
+        return None, f"`as` warned about the generated assembly:\n{err.decode(errors='replace')}"
     return mir, None
 
 
@@ -274,6 +282,8 @@ def main():
             failures += 1
             continue
         mir, err = build_rmc(name)
+        if not err:
+            bu, err = build_rmc(name, binutils=True)
         if err:
             print(f"FAIL {name}: {err}")
             failures += 1
@@ -283,9 +293,16 @@ def main():
         for argv in vectors:
             r_rc, r_out, _ = run([ref] + argv)
             m_rc, m_out, _ = run([mir] + argv)
+            b_rc, b_out, _ = run([bu] + argv)
             if r_rc != m_rc or r_out != m_out:
                 print(f"FAIL {name} {argv}: rustc rc={r_rc} out={r_out!r} | "
                       f"rmc rc={m_rc} out={m_out!r}")
+                bad = True
+                failures += 1
+                break
+            if (b_rc, b_out) != (m_rc, m_out):
+                print(f"FAIL {name} {argv}: in-process rc={m_rc} out={m_out!r} | "
+                      f"--binutils rc={b_rc} out={b_out!r}")
                 bad = True
                 failures += 1
                 break
