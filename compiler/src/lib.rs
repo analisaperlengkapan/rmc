@@ -53,6 +53,32 @@ pub struct CompileOptions {
     pub no_tco: bool,
 }
 
+/// The largest stack frame a function may ask for, in bytes. Linux gives the
+/// main thread an 8 MiB stack by default; a frame near that size faults on its
+/// first touch. rmc stores every array element in its own 8-byte slot, so
+/// `[u8; 1 << 20]` (1 MiB in rustc) needs an 8 MiB frame here.
+const MAX_FRAME_BYTES: i64 = 6 << 20;
+
+/// Reject a function whose frame cannot fit the default stack, with a message
+/// that says why, instead of emitting a binary that segfaults on entry.
+fn check_frame_sizes(prog: &ast::Program) -> Result<(), String> {
+    for f in &prog.fns {
+        let bytes = f.nslots as i64 * 8;
+        if bytes > MAX_FRAME_BYTES {
+            return Err(format!(
+                "function `{}` needs a {:.1} MiB stack frame, more than the {} MiB rmc allows: \
+                 rmc stores every array element in an 8-byte slot (a `[u8; N]` takes 8*N bytes), \
+                 so a large local array does not fit the default 8 MiB stack; \
+                 allocate it with `vec![..]` instead",
+                f.name.split('$').last().unwrap_or(&f.name),
+                bytes as f64 / (1 << 20) as f64,
+                MAX_FRAME_BYTES >> 20
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Compile `src` (a `.rs` program) to x86-64 assembly in GNU `as` syntax.
 ///
 /// The returned string is a complete translation unit: the compiled program
@@ -75,6 +101,7 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
         licm::run(&mut prog, opts.overflow_checks);
     }
     dce::run(&mut prog);
+    check_frame_sizes(&prog)?;
 
     let mut cg = codegen::Codegen::new();
     if opts.overflow_checks {
