@@ -362,8 +362,16 @@ fn run(opts: Options) -> Result<(), String> {
 }
 
 fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
+    // Keep branches off 32-byte boundaries the way the in-process assembler
+    // does (`elf.rs`, `branch_pts`), padding with `nop`s only, so the two link
+    // paths lay hot loops out alike.
     let out = Command::new("as")
         .arg("--64")
+        .args([
+            "-malign-branch-boundary=32",
+            "-malign-branch=jcc+fused+jmp",
+            "-malign-branch-prefix-size=0",
+        ])
         .arg("-o")
         .arg(obj)
         .arg(asm)

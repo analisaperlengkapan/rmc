@@ -94,7 +94,23 @@ pub struct Elf {
     /// Definition counter: labels and align directives share it so their
     /// relative order at the same offset is preserved.
     defs: u64,
+    /// One per branch to a label: `(section, offset, ord, prefix, branch)`.
+    /// `offset` is where the branch starts, or where the instruction it
+    /// macro-fuses with starts (`cmp`/`test`/... right before a `jcc`), and
+    /// `prefix` is that instruction's length. `relax_branches` pads the group
+    /// with `nop`s when it would cross or end on a 32-byte boundary: on recent
+    /// Intel cores such a branch is not served from the decoded-µop cache, and
+    /// a loop whose fused `cmp`+`jcc` straddles the boundary ran 4x slower
+    /// (`heavy`), with the speed decided by where the code happened to land.
+    branch_pts: Vec<(usize, u64, u64, u64, usize)>,
+    /// The last instruction parsed, as `(section, start, end, ord, fusible)`,
+    /// or `None` after a label or a directive (a branch target or an alignment
+    /// pad between two instructions keeps them from being treated as a pair).
+    last_insn: Option<(usize, u64, u64, u64, bool)>,
 }
+
+/// The boundary a branch must not cross or end on (see `Elf::branch_pts`).
+const BRANCH_BOUNDARY: i64 = 32;
 
 /// Assemble `asm` (the text `compile_to_asm` returns) into a static executable.
 pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
@@ -122,6 +138,8 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         nbranches: 0,
         align_pts: Vec::new(),
         defs: 0,
+        branch_pts: Vec::new(),
+        last_insn: None,
     };
     e.parse(asm)?;
     e.relax_branches()?;
@@ -175,6 +193,7 @@ impl Elf {
                     let ord = self.defs;
                     self.defs += 1;
                     self.syms.insert(name.to_string(), Sym { sec: cur, off, abs: false, ord });
+                    self.last_insn = None;
                     line = rest[1..].trim();
                     if line.is_empty() {
                         continue;
@@ -182,11 +201,13 @@ impl Elf {
                 }
             }
             if let Some(rest) = line.strip_prefix('.') {
+                self.last_insn = None;
                 self.directive(rest, &mut cur, &mut sets)
                     .map_err(|e| format!("{e} (line {})", lineno + 1))?;
                 continue;
             }
-            self.instruction(line, cur).map_err(|e| format!("{e} (line {})", lineno + 1))?;
+            self.instruction_tracked(line, cur)
+                .map_err(|e| format!("{e} (line {})", lineno + 1))?;
         }
 
         for (name, a, b, sec, dot) in sets {
@@ -411,12 +432,24 @@ impl Elf {
         // Align points in layout order. Two at the same offset keep their
         // definition order, so the pad they describe lands where the source put
         // it.
-        let mut al: Vec<(usize, i64, i64, u64)> = self
+        // `(section, offset, ord, alignment or 0, prefix, branch)`: an
+        // alignment point pads to `alignment`; a branch point (alignment 0)
+        // pads its group off a 32-byte boundary.
+        let mut b_of: Vec<usize> = vec![usize::MAX; n];
+        for (b, &i) in order.iter().enumerate() {
+            b_of[self.fixups[i].branch] = b;
+        }
+        let mut al: Vec<(usize, i64, u64, i64, i64, usize)> = self
             .align_pts
             .iter()
-            .map(|(s, o, a, ord)| (*s, *o as i64, *a as i64, *ord))
+            .map(|(s, o, a, ord)| (*s, *o as i64, *ord, *a as i64, 0, usize::MAX))
             .collect();
-        al.sort_by_key(|(s, o, _, ord)| (*s, *o, *ord));
+        for &(s, o, ord, prefix, br) in &self.branch_pts {
+            if br < n && b_of[br] != usize::MAX {
+                al.push((s, o as i64, ord, 0, prefix as i64, b_of[br]));
+            }
+        }
+        al.sort_by_key(|(s, o, ord, ..)| (*s, *o, *ord));
 
         // Removals and paddings are kept sorted by position with prefix sums,
         // so "how much was removed/inserted before offset `o`" is a binary
@@ -472,10 +505,20 @@ impl Elf {
             }
             // `al` is sorted by (section, offset, ord), so each pad is placed
             // after every pad that precedes it.
-            for &(sec, o, a, ord) in &al {
+            for &(sec, o, ord, a, prefix, b) in &al {
                 let sh = &mut out[sec];
                 let pos = o - sh.removed_before(o) + sh.inserted_before(o, ord);
-                let pad = (a - pos.rem_euclid(a)) % a;
+                let pad = if a > 0 {
+                    (a - pos.rem_euclid(a)) % a
+                } else {
+                    let len = prefix + if short[b] { 2 } else { orig_len[b] };
+                    let r = pos.rem_euclid(BRANCH_BOUNDARY);
+                    if r + len >= BRANCH_BOUNDARY && len < BRANCH_BOUNDARY {
+                        BRANCH_BOUNDARY - r
+                    } else {
+                        0
+                    }
+                };
                 if pad > 0 {
                     sh.pad_at.push((o, ord));
                     sh.pad_len.push(pad);
@@ -506,8 +549,11 @@ impl Elf {
             short = next;
         }
         // A branch that ends up out of range keeps its rel32 form; the rel32
-        // encoding reaches anywhere this compiler emits.
-        for _ in 0..64 {
+        // encoding reaches anywhere this compiler emits. Branches only ever
+        // lengthen here, so this terminates; it runs to the fixpoint because a
+        // lengthened branch moves the padding after it, which can push another
+        // short branch out of range.
+        loop {
             let sh = compute(&short);
             let mut changed = false;
             for b in 0..n {
@@ -867,6 +913,38 @@ fn parse_string_literal(arg: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 impl Elf {
+    /// Encode one instruction and record a branch-boundary pad point for a
+    /// branch to a label (see `branch_pts`).
+    fn instruction_tracked(&mut self, line: &str, sec: usize) -> Result<(), String> {
+        let mnem = line.split_whitespace().next().unwrap_or("");
+        let start = self.sections[sec].data.len() as u64;
+        let ord = self.defs;
+        self.defs += 1;
+        let branches_before = self.nbranches;
+        self.instruction(line, sec)?;
+        let end = self.sections[sec].data.len() as u64;
+        if self.nbranches > branches_before {
+            let b = self.nbranches - 1;
+            let is_jcc = mnem != "jmp";
+            let pt = match self.last_insn {
+                Some((s, st, e, o, true)) if is_jcc && s == sec && e == start => {
+                    (sec, st, o, start - st, b)
+                }
+                _ => (sec, start, ord, 0, b),
+            };
+            self.branch_pts.push(pt);
+            self.last_insn = None;
+        } else {
+            let fusible = matches!(
+                mnem,
+                "cmp" | "cmpq" | "test" | "testq" | "add" | "addq" | "sub" | "subq" | "and"
+                    | "andq" | "inc" | "dec"
+            );
+            self.last_insn = Some((sec, start, end, ord, fusible));
+        }
+        Ok(())
+    }
+
     fn instruction(&mut self, line: &str, sec: usize) -> Result<(), String> {
         let (mnem, rest) = match line.split_once(char::is_whitespace) {
             Some((m, r)) => (m, r.trim()),
@@ -2297,7 +2375,86 @@ mod tests {
             align_pts: Vec::new(),
             defs: 0,
             text_idx: 0,
+            branch_pts: Vec::new(),
+            last_insn: None,
         }
+    }
+
+    /// The `.text` bytes of a whole assembled program (the RX segment's file
+    /// image starts with the ELF header, so locate `.text` by the entry).
+    fn text_of(asm: &str) -> Vec<u8> {
+        relaxed(asm).sections[0].data.clone()
+    }
+
+    fn relaxed(asm: &str) -> Elf {
+        let mut e = Elf {
+            sections: vec![Section {
+                name: ".text",
+                flags: 0x5,
+                align: 64,
+                data: Vec::new(),
+                vaddr: 0,
+                file_off: 0,
+                bss: false,
+            }],
+            syms: HashMap::new(),
+            fixups: Vec::new(),
+            abs64: Vec::new(),
+            abs_imm: Vec::new(),
+            nbranches: 0,
+            align_pts: Vec::new(),
+            defs: 0,
+            text_idx: 0,
+            branch_pts: Vec::new(),
+            last_insn: None,
+        };
+        e.parse(asm).expect("parses");
+        e.relax_branches().expect("relaxes");
+        e
+    }
+
+    /// Offset of the first occurrence of `pat` in `hay`.
+    fn find(hay: &[u8], pat: &[u8]) -> usize {
+        hay.windows(pat.len()).position(|w| w == pat).expect("pattern present")
+    }
+
+    #[test]
+    fn a_fused_compare_and_branch_never_crosses_32_bytes() {
+        // 29 bytes of filler put `cmp %r12,%rbx` (3 bytes) at 29..32 and the
+        // relaxed `jge` at 32..34: the fused pair would straddle offset 32.
+        // It must be pushed to start on the boundary instead.
+        let filler = "  nop\n".repeat(29);
+        let asm = format!(".text\nf:\n{filler}.Ltop:\n  cmp %r12, %rbx\n  jge .Ltop\n  ret\n");
+        let e = relaxed(&asm);
+        let t = &e.sections[0].data;
+        let at = find(t, &[0x4c, 0x39, 0xe3]);
+        assert_eq!(at % 32, 0, "cmp at {at}: {t:x?}");
+        // The pair is still a pair (the short `jge` follows the `cmp`
+        // directly), and the label stays *before* the padding, so a jump to it
+        // runs the `nop`s and then the pair.
+        assert_eq!(t[at + 3], 0x7d);
+        assert_eq!(e.syms[".Ltop"].off, 29);
+        let fx = e.fixups.iter().find(|f| f.sym == ".Ltop").expect("fixup");
+        assert_eq!((fx.disp_off, fx.next_off, fx.width), (at + 4, at + 5, 1));
+    }
+
+    #[test]
+    fn a_branch_that_ends_on_the_boundary_moves() {
+        // 30 filler bytes put a 2-byte `jmp` at 30..32: it ends on the
+        // boundary, which also takes it out of the decoded-uop cache.
+        let filler = "  nop\n".repeat(30);
+        let asm = format!(".text\nf:\n{filler}  jmp .Lx\n.Lx:\n  ret\n");
+        let t = text_of(&asm);
+        let at = find(&t[30..], &[0xeb]) + 30;
+        assert_eq!(at % 32, 0, "jmp at {at}: {t:x?}");
+    }
+
+    #[test]
+    fn a_branch_clear_of_the_boundary_is_not_padded() {
+        let filler = "  nop\n".repeat(10);
+        let asm = format!(".text\nf:\n{filler}  cmp %r12, %rbx\n  jge f\n  ret\n");
+        let t = text_of(&asm);
+        assert_eq!(t.len(), 10 + 3 + 2 + 1, "{t:x?}");
     }
 
     fn encode_one(line: &str) -> Vec<u8> {
