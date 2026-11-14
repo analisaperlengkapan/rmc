@@ -4388,10 +4388,20 @@ impl<'a> FnGen<'a> {
         // immediate on the left is routed through the general path, which loads
         // it into `%rax` first.
         if !matches!(a, Operand::Const(_)) && self.operand_is_simple(a) && self.operand_is_simple(b) {
-            let (av, _) = self.eval_operand(a)?;
-            let (bv, _) = self.eval_operand(b)?;
+            let (av, a_mem) = self.eval_operand(a)?;
+            let (bv, b_mem) = self.eval_operand(b)?;
             let bv = self.wide_imm(&bv, "%rcx");
-            self.emit(&format!("  cmp {bv}, {av}"));
+            // x86 has no memory-to-memory `cmp`. Two unpromoted locals are both
+            // frame slots, which a function with more live values than
+            // registers produces (an interpreter loop, a parser); emitting
+            // `cmp -848(%rbp), -904(%rbp)` failed to assemble, or, once a
+            // peephole rewrote a neighbour, assembled into the wrong compare.
+            if a_mem && b_mem {
+                self.emit(&format!("  mov {av}, %rax"));
+                self.emit(&format!("  cmp {bv}, %rax"));
+            } else {
+                self.emit(&format!("  cmp {bv}, {av}"));
+            }
             return Ok(());
         }
         // Load `a` into `%rax`, keep it while `b` is evaluated into `%rcx`,
