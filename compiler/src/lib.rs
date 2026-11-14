@@ -92,6 +92,75 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     Ok(asm)
 }
 
+/// Settings for the MIR pipeline. The `rmc` CLI (`--rustc-frontend`, `.mir`
+/// input) and the `-Zcodegen-backend` dylib both build one of these and call
+/// [`optimize_mir`], so the two routes run exactly the same passes. They used
+/// to carry two hand-copied pass lists that drifted apart (the dylib skipped
+/// `prune_unreachable`, and the CLI parsed with overflow checks always off).
+#[derive(Clone, Debug)]
+pub struct MirOptions {
+    /// The crate was built with `-C overflow-checks=on`: selects the checked
+    /// arm of `switchInt(OverflowChecks)` and disables reassociating passes.
+    pub overflow_checks: bool,
+    pub inline: bool,
+    pub licm: bool,
+    pub tco: bool,
+}
+
+impl Default for MirOptions {
+    fn default() -> Self {
+        MirOptions { overflow_checks: false, inline: true, licm: true, tco: true }
+    }
+}
+
+/// Run the MIR optimisation pipeline over `prog`.
+///
+/// Debugging switches, read from the environment so a miscompile can be
+/// bisected without rebuilding:
+///
+/// * `RMC_SKIP_MIR_PASSES=a,b` skips the named passes (the names below);
+/// * `RMC_TIME=1` prints each pass's wall time to stderr.
+pub fn optimize_mir(prog: &mut mir::Program, o: &MirOptions) {
+    let skip = std::env::var("RMC_SKIP_MIR_PASSES").unwrap_or_default();
+    let timing = std::env::var_os("RMC_TIME").is_some();
+    let ovf = o.overflow_checks;
+    type Pass<'a> = (&'static str, bool, &'a dyn Fn(&mut mir::Program));
+    let passes: [Pass; 14] = [
+        ("tco", o.tco, &|p| mir::tco(p, ovf)),
+        ("inline", o.inline, &mir::inline_calls),
+        ("coalesce_call_results", true, &mir::coalesce_call_results),
+        ("merge_blocks", true, &mir::merge_blocks),
+        ("copy_propagate", true, &|p| p.copy_propagate()),
+        ("drop_redundant_asserts", true, &mir::drop_redundant_asserts),
+        ("licm", o.licm, &mir::licm),
+        ("fold_accumulators", true, &mir::fold_accumulators),
+        ("strength_reduce", true, &mir::strength_reduce),
+        ("close_counted_loops", true, &|p| mir::close_counted_loops(p, ovf)),
+        ("jump_thread", true, &mir::jump_thread),
+        ("prune_unreachable", true, &mir::prune_unreachable),
+        ("rotate_loops", true, &mir::rotate_loops),
+        ("layout_blocks", true, &mir::layout_blocks),
+    ];
+    for (name, enabled, run) in passes {
+        if !enabled || skip.split(',').any(|s| s.trim() == name) {
+            continue;
+        }
+        let t = std::time::Instant::now();
+        run(prog);
+        if timing {
+            eprintln!("{name:>24} {:8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+/// Parse `rustc --emit=mir` text, optimise it, and lower it to assembly
+/// (program plus runtime). The single entry point both MIR routes use.
+pub fn mir_text_to_asm(text: &str, o: &MirOptions) -> Result<String, String> {
+    let mut prog = mir::parse_with(text, o.overflow_checks)?;
+    optimize_mir(&mut prog, o);
+    compile_mir_to_asm(&prog, &mir_codegen::Options { promote: true })
+}
+
 /// Compile a parsed MIR program to x86-64 assembly (program plus runtime).
 ///
 /// The MIR path shares the freestanding runtime and the in-process assembler
