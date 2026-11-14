@@ -5390,7 +5390,7 @@ fn rcx_next_is_write(lines: &[&str], from: usize) -> bool {
         if !reg_mentions(t, "%rcx") {
             continue;
         }
-        if let Some((src, dst)) = t.split_once(',') {
+        if let Some((src, dst)) = split_ops(t) {
             let op = t.split_whitespace().next().unwrap_or("");
             if dst.trim() == "%rcx" && !src.contains("%rcx") && matches!(op, "mov" | "movq" | "lea") {
                 return true;
@@ -5441,7 +5441,7 @@ fn fold_lea_terms(body: &str) -> String {
 fn lea_local(line: &str) -> Option<(i64, &str)> {
     let t = line.trim();
     let rest = t.strip_prefix("lea ")?;
-    let (mem, dst) = rest.split_once(',')?;
+    let (mem, dst) = split_ops(rest)?;
     let (mem, dst) = (mem.trim(), dst.trim());
     let disp = mem.strip_suffix("(%rbp)")?;
     let disp: i64 = disp.parse().ok()?;
@@ -5509,7 +5509,7 @@ fn fold_base(line: &str, t: &str, src: &str, k: i64) -> Option<(String, bool)> {
     }
     let disp = if k == 0 { format!("({src})") } else { format!("{k}({src})") };
     let rewritten = line.replacen(&old, &disp, 1);
-    let dst = line.trim().split_once(',').map(|(_, d)| d.trim());
+    let dst = split_ops(line.trim()).map(|(_, d)| d.trim());
     let writes_t = dst == Some(t);
     Some((rewritten, writes_t))
 }
@@ -5617,7 +5617,7 @@ fn scaled_lea(k: i64, s: &str, t: &str) -> Option<String> {
 fn mov_imm(line: &str) -> Option<(i64, &str)> {
     let t = line.trim();
     let rest = t.strip_prefix("mov ").or_else(|| t.strip_prefix("movabs "))?;
-    let (imm, dst) = rest.split_once(',')?;
+    let (imm, dst) = split_ops(rest)?;
     let k: i64 = imm.trim().strip_prefix('$')?.parse().ok()?;
     let dst = dst.trim();
     is_reg(dst).then_some((k, dst))
@@ -5627,7 +5627,7 @@ fn mov_imm(line: &str) -> Option<(i64, &str)> {
 fn binop_reg(line: &str) -> Option<(&str, &str, &str)> {
     let t = line.trim();
     let (op, rest) = t.split_once(' ')?;
-    let (a, d) = rest.split_once(',')?;
+    let (a, d) = split_ops(rest)?;
     let (a, d) = (a.trim(), d.trim());
     (is_reg(a) && is_reg(d)).then_some((op, a, d))
 }
@@ -5776,7 +5776,7 @@ fn reads_reg(line: &str, r: &str) -> bool {
             | "setle" | "setge" | "setb" | "seta" | "movzbl" | "movsbl" | "movslq"
     );
     if write_only_dst {
-        match rest.rsplit_once(',') {
+        match split_ops(rest) {
             Some((src, _dst)) => reg_mentions(src, r),
             None => reg_mentions(rest, r),
         }
@@ -5830,7 +5830,7 @@ fn read_slots(body: &str) -> HashSet<i64> {
         // `mov <non-slot>, <slot>` writes the slot without reading it.
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("mov ").or_else(|| t.strip_prefix("movq ")) {
-            if let Some((src, dst)) = rest.split_once(',') {
+            if let Some((src, dst)) = split_ops(rest) {
                 if !src.contains("(%rbp)") && dst.trim().ends_with("(%rbp)") {
                     continue;
                 }
@@ -5845,7 +5845,7 @@ fn read_slots(body: &str) -> HashSet<i64> {
 fn mov_reg_reg(line: &str) -> Option<(&str, &str)> {
     let t = line.trim();
     let rest = t.strip_prefix("mov ")?;
-    let (a, b) = rest.split_once(',')?;
+    let (a, b) = split_ops(rest)?;
     let (a, b) = (a.trim(), b.trim());
     (is_reg(a) && is_reg(b)).then_some((a, b))
 }
@@ -5854,7 +5854,7 @@ fn mov_reg_reg(line: &str) -> Option<(&str, &str)> {
 fn lea_disp(line: &str) -> Option<(i64, &str, &str)> {
     let t = line.trim();
     let rest = t.strip_prefix("lea ")?;
-    let (mem, dst) = rest.split_once(',')?;
+    let (mem, dst) = split_ops(rest)?;
     let mem = mem.trim();
     let open = mem.find('(')?;
     let close = mem.find(')')?;
@@ -5871,7 +5871,7 @@ fn addsub_imm(line: &str) -> Option<(&str, i64, &str)> {
     if op != "add" && op != "sub" {
         return None;
     }
-    let (imm, dst) = rest.split_once(',')?;
+    let (imm, dst) = split_ops(rest)?;
     let k: i64 = imm.trim().strip_prefix('$')?.parse().ok()?;
     Some((op, k, dst.trim()))
 }
@@ -5915,7 +5915,7 @@ fn forward_stores(body: &str) -> String {
             continue;
         }
         let rest = t[op.len()..].trim();
-        let pair = rest.split_once(',').map(|(a, b)| (a.trim(), b.trim()));
+        let pair = split_ops(rest).map(|(a, b)| (a.trim(), b.trim()));
         // `cmp`/`test` read both operands, so the second one is not a write: a
         // slot there can be forwarded to the register that still holds it (the
         // bounds check compares an index slot the code just stored), and the
@@ -6011,6 +6011,29 @@ fn drop_holding(holding: &mut HashMap<String, String>, reg: &str) {
 
 /// Registers an instruction definitely writes. The destination operand covers
 /// most forms; the multiply/divide forms write `%rax`/`%rdx` implicitly.
+/// Split an AT&T operand list into everything before the last operand and the
+/// last operand, at the last comma *outside parentheses*.
+///
+/// A scaled-index address carries commas of its own: `lea 0(,%r15,4), %rax`
+/// split at the first comma gave the destination `%r15,4), %rax`, which is no
+/// register, so `written_regs` missed the write to `%rax` and `forward_stores`
+/// went on believing `%rax` held a value it had just overwritten (`a * (4*b)`
+/// became `(4*b) * (4*b)`). The same address can be a destination
+/// (`mov %rax, (%rcx,%rdx,8)`), where splitting at the *last* comma fails too.
+fn split_ops(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let mut cut = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => cut = Some(i),
+            _ => {}
+        }
+    }
+    cut.map(|i| (&s[..i], &s[i + 1..]))
+}
+
 fn written_regs(op: &str, line: &str) -> Vec<String> {
     let mut w = Vec::new();
     match op {
@@ -6031,7 +6054,7 @@ fn written_regs(op: &str, line: &str) -> Vec<String> {
         }
         _ => {}
     }
-    if let Some((_, dst)) = line.split_once(',') {
+    if let Some((_, dst)) = split_ops(line) {
         let dst = dst.trim();
         if is_reg(dst) {
             w.push(canon_reg(dst));
@@ -6080,7 +6103,7 @@ fn drop_unread_stores(body: &str) -> String {
         let t = line.trim();
         let Some((_, rest)) = t.split_once(char::is_whitespace) else { continue };
         // A `mov`'s destination is write-only; every other operand is a read.
-        match rest.split_once(',') {
+        match split_ops(rest) {
             Some((src, dst)) => {
                 for slot in slots_in(src) {
                     read.insert(slot.to_string());
@@ -6140,7 +6163,7 @@ fn slots_in(line: &str) -> Vec<&str> {
 /// an ALU op whose destination is memory). Returns `None` for a load.
 fn store_slot(line: &str) -> Option<&str> {
     let t = line.trim();
-    let (_, dst) = t.split_once(',')?;
+    let (_, dst) = split_ops(t)?;
     let dst = dst.trim();
     if !dst.ends_with("(%rbp)") {
         return None;
@@ -6222,7 +6245,7 @@ fn suffix_imm_mem(body: &str) -> String {
         let indent = &line[..line.len() - t.len()];
         let rewritten = t.split_once(' ').and_then(|(op, rest)| {
             let alu = matches!(op, "add" | "sub" | "and" | "or" | "xor" | "cmp");
-            let (src, dst) = rest.split_once(',')?;
+            let (src, dst) = split_ops(rest)?;
             (alu && src.trim().starts_with('$') && dst.trim().ends_with(')'))
                 .then(|| format!("{indent}{op}q {rest}"))
         });
@@ -6484,7 +6507,7 @@ fn peephole(body: &str) -> String {
 /// `mov <reg>, <slot>` with a register source, returning `(reg, slot)`.
 fn store_pair(line: &str) -> Option<(&str, &str)> {
     let rest = line.trim().strip_prefix("mov ")?;
-    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = split_ops(rest)?;
     let (src, dst) = (src.trim(), dst.trim());
     if !src.starts_with('%') || src.contains('(') || !dst.contains('(') {
         return None;
@@ -6495,7 +6518,7 @@ fn store_pair(line: &str) -> Option<(&str, &str)> {
 /// `mov <slot>, <reg>` with a memory source, returning `(slot, reg)`.
 fn load_pair(line: &str) -> Option<(&str, &str)> {
     let rest = line.trim().strip_prefix("mov ")?;
-    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = split_ops(rest)?;
     let (src, dst) = (src.trim(), dst.trim());
     if !src.contains('(') || !dst.starts_with('%') {
         return None;
@@ -7097,6 +7120,35 @@ fn main() -> () {
             suffix_imm_mem(body),
             "  cmpq $32, -472(%rbp)\n  addq $8, (%rax)\n  cmp $3, %rax\n  mov $0, -8(%rbp)\n"
         );
+    }
+
+    /// Operands split at the last comma outside parentheses, so a scaled-index
+    /// address on either side stays whole.
+    #[test]
+    fn operand_split_respects_scaled_index_addresses() {
+        assert_eq!(split_ops("0(,%r15,4), %rax"), Some(("0(,%r15,4)", " %rax")));
+        assert_eq!(split_ops("%rax, (%rcx,%rdx,8)"), Some(("%rax", " (%rcx,%rdx,8)")));
+        assert_eq!(split_ops("$3, %rdx, %rdx"), Some(("$3, %rdx", " %rdx")));
+        assert_eq!(split_ops("%rax"), None);
+    }
+
+    /// The write of an `lea` with a scaled index, and of a three-operand `imul`,
+    /// is seen; both were missed when the destination was read off the first
+    /// comma.
+    #[test]
+    fn writes_through_scaled_lea_and_three_operand_imul_are_seen() {
+        assert_eq!(written_regs("lea", "  lea 0(,%r15,4), %rax"), vec!["%rax".to_string()]);
+        assert_eq!(written_regs("imul", "  imul $3, %rdx, %rdx"), vec!["%rdx".to_string()]);
+    }
+
+    /// The fuzz-found miscompile: `%rax` is stored, overwritten by a scaled
+    /// `lea`, then reloaded. The reload must survive, or `a * (4*b)` becomes
+    /// `(4*b) * (4*b)`.
+    #[test]
+    fn forward_stores_sees_a_scaled_lea_overwrite_the_register() {
+        let body = "  mov %rax, -240(%rbp)\n  lea 0(,%r15,4), %rax\n  mov %rax, -280(%rbp)\n  mov -240(%rbp), %rax\n  imul -280(%rbp), %rax\n";
+        let out = forward_stores(body);
+        assert!(out.contains("mov -240(%rbp), %rax"), "the reload of the stored value was dropped:\n{out}");
     }
 
     /// `mov $k, %t; sub %s, %t` is `k - s`. No `lea` displacement expresses
