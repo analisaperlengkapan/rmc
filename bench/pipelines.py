@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
-"""Compare four pipelines on the same source: the true `-Zcodegen-backend`,
-the printed-MIR prototype, LLVM, and rustc's Cranelift back end.
+"""Shared build and measurement helpers for the benchmark harnesses.
 
-  * ``cb``   -- ``rustc +nightly -Zcodegen-backend=libr... .so src -o bin``.
-                One rustc process; rmc lowers the MIR in-process and writes
-                the ELF itself. No MIR text, no second process, no `ld`.
-  * ``mir``  -- ``rustc --emit=mir -O -Zno-codegen`` then ``rmcmir``. The
-                prototype: same back end, but the interface is printed MIR.
-  * ``llvm`` -- ``rustc --emit=obj -O -C lto=fat`` then ``ld -s``. The
-                reference the whole experiment is against.
-  * ``cl``   -- ``rustc -Zcodegen-backend=cranelift --emit=obj -O`` then
-                ``ld -s``. rustc's other non-LLVM back end, and the closest
-                like-for-like rival: it has no LTO, so that one flag is the
-                only difference from the ``llvm`` row.
+The commands that build a program with each pipeline, and the code that times
+them, live here so every harness measures the same way:
 
-All four use the *same* nightly front end, so a compile difference is the
-back end and the interface, not the parser. ``cb`` and ``mir`` link the same
-freestanding runtime; ``llvm`` and ``cl`` link it too (plus trap stubs for the
-panic entry points rmc lowers to its own traps), so run-time numbers compare
-the same program.
+  * ``RMC``        -- rmc's own front end and back end (the ``rmc`` binary).
+  * ``CB``         -- rustc with rmc as a ``-Zcodegen-backend`` dylib: rustc's
+                      front end and MIR optimiser, rmc's x86-64 back end, one
+                      process, no LLVM.
+  * ``RUSTC_OBJ``  -- rustc's LLVM back end (``-O -C lto=fat``), linked with
+                      ``ld`` against rmc's freestanding runtime.
+  * ``CL``         -- rustc's Cranelift back end, linked the same way.
 
-Fairness rules, the same as ``run_fair.py``: every back end must produce the
-same stdout and exit status, and every stage is sampled round-robin so thermal
-drift cannot favour whichever ran first.
-
-Usage: python3 bench/run_codegen.py [program ...]
+Fairness rules: every binary must print the same stdout with the same exit
+status before any time is reported (``verify_outputs``); every stage and every
+run is sampled round-robin so thermal drift cannot favour whichever ran first;
+a run below ``RUN_FLOOR`` is reported as unmeasured rather than as a ratio; and
+a ratio is averaged geometrically, the only mean under which a 2x win and a 2x
+loss cancel.
 """
+import math
 import os
 import shutil
 import subprocess
@@ -37,7 +31,6 @@ os.environ.setdefault("RUSTC_BOOTSTRAP", "1")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(ROOT)
 RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
-RMCMIR = os.path.join(PROJ, "compiler", "target", "release", "examples", "rmcmir")
 CBWRAP = os.path.join(PROJ, "backend", "rmc-rustc")
 CBSO = os.path.join(PROJ, "backend", "target", "release",
                     "librmc_codegen_backend.so")
@@ -59,18 +52,8 @@ def pinned_channel():
                 return val.strip().strip('"')
     raise SystemExit("no `channel` in backend/rust-toolchain.toml")
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs",
-            "heap", "callrec", "forloops", "light", "heavy"]
-ARGS = {
-    "hello": [], "fib": ["32"], "mandel": ["800"], "sieve": ["200000"],
-    "mix": ["2000000"], "stats": ["2000000"], "refs": ["5000000"],
-    "heap": ["200000"], "callrec": ["30"], "forloops": ["2000000"],
-    "light": ["2000000"], "heavy": ["1000000000"],
-}
 
 RUSTC = ["rustc", "+" + pinned_channel()]
-RUSTC_MIR = RUSTC + ["--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",
-                     "--crate-type=bin", "--edition", "2021", "-Awarnings"]
 RUSTC_OBJ = RUSTC + ["--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
                      "-C", "codegen-units=1", "-C", "panic=abort",
                      "--edition", "2021", "-Awarnings"]
@@ -272,50 +255,25 @@ def build_runtime():
     return obj, stub_o
 
 
-def pipeline_stages(name, runtime_obj, stub_obj):
-    src = os.path.join(ROOT, "mir", f"{name}.rs")
-    mir = os.path.join(OUT, f"{name}.mir")
-    cb_bin = os.path.join(OUT, f"{name}.cb.bin")
-    mir_bin = os.path.join(OUT, f"{name}.mir.bin")
-    obj = os.path.join(OUT, f"{name}.llvm.o")
-    llvm_bin = os.path.join(OUT, f"{name}.llvm.bin")
-    cl_obj = os.path.join(OUT, f"{name}.cl.o")
-    cl_bin = os.path.join(OUT, f"{name}.cl.bin")
-    stages = [
-        # Single process: rustc drives rmc's backend, which writes the ELF.
-        ("cb", CB + [src, "-o", cb_bin]),
-        ("mir.front", RUSTC_MIR + [src, "-o", mir]),
-        ("mir.back", [RMCMIR, mir, "-o", mir_bin]),
-        ("llvm.front", RUSTC_OBJ + [src, "-o", obj]),
-        ("llvm.back", ["ld", "-s", "-o", llvm_bin, "-e", "_start", obj,
-                       runtime_obj, stub_obj]),
-        ("cl.front", CL + [src, "-o", cl_obj]),
-        ("cl.back", ["ld", "-s", "-o", cl_bin, "-e", "_start", cl_obj,
-                     runtime_obj, stub_obj]),
-    ]
-    return stages, cb_bin, mir_bin, llvm_bin, cl_bin
-
-
-def measure_program(name, runtime_obj, stub_obj, reps=9):
-    stages, cb_bin, mir_bin, llvm_bin, cl_bin = pipeline_stages(
-        name, runtime_obj, stub_obj)
-    r = measure_stages(stages, reps)
-    return {
-        "cb": {"wall": r["cb"]["wall"], "cpu": r["cb"]["cpu"],
-               "rss": r["cb"]["rss"], "size": os.path.getsize(cb_bin)},
-        "mir": {"wall": r["mir.front"]["wall"] + r["mir.back"]["wall"],
-                "cpu": r["mir.front"]["cpu"] + r["mir.back"]["cpu"],
-                "rss": max(r["mir.front"]["rss"], r["mir.back"]["rss"]),
-                "size": os.path.getsize(mir_bin)},
-        "llvm": {"wall": r["llvm.front"]["wall"] + r["llvm.back"]["wall"],
-                 "cpu": r["llvm.front"]["cpu"] + r["llvm.back"]["cpu"],
-                 "rss": max(r["llvm.front"]["rss"], r["llvm.back"]["rss"]),
-                 "size": os.path.getsize(llvm_bin)},
-        "cl": {"wall": r["cl.front"]["wall"] + r["cl.back"]["wall"],
-               "cpu": r["cl.front"]["cpu"] + r["cl.back"]["cpu"],
-               "rss": max(r["cl.front"]["rss"], r["cl.back"]["rss"]),
-               "size": os.path.getsize(cl_bin)},
-    }
+def object_stubs(obj):
+    """Trap stubs for every symbol `obj` leaves undefined that the runtime does
+    not define (in practice, the `core::panicking` entries). An unoptimised or
+    Cranelift object keeps panic paths the `-O` probe in `build_runtime` never
+    sees (overflow checks, for one), so those builds link against stubs read
+    off their own `nm -u` instead."""
+    runtime = {"arg_i64", "print_i64", "print_str", "alloc", "free", "putchar", "exit"}
+    out = subprocess.run(["nm", "-u", obj], capture_output=True, text=True, check=True)
+    names = [l.split()[-1] for l in out.stdout.splitlines() if l.split()]
+    names = [n for n in names if n not in runtime]
+    lines = ["\t.text", "__extra_trap:", "\tmov $60, %rax", "\tmov $101, %rdi", "\tsyscall"]
+    for n in names:
+        lines += [f'\t.globl "{n}"', f'"{n}":', "\tjmp __extra_trap"]
+    src = obj + ".stubs.s"
+    with open(src, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    stub = obj + ".stubs.o"
+    subprocess.run(["as", "--64", "-o", stub, src], check=True)
+    return stub
 
 
 def verify_outputs(bins, args):
@@ -411,58 +369,16 @@ def report_vs(rows, base, label, axes, flag_losses=False, kind="cb"):
         suffix = "" if (ok or not flag_losses) else "  <-- LOSS"
         print(f"{p:<9} " + " ".join(cells) + suffix)
     print()
-    print(f"mean speedup per axis ({kind} vs {base})")
+    print(f"geometric-mean speedup per axis ({kind} vs {base})")
     for a in axes:
         vs = [v for v in means[a] if v is not None]
         if not vs:
             print(f"  {a:<9}       -  (unmeasured)")
             continue
-        m = sum(vs) / len(vs)
+        m = math.prod(vs) ** (1.0 / len(vs))
         verdict = "win" if m >= 1.0 + NOISE_BAND else (
             "tie" if m >= 1.0 - NOISE_BAND else "loss")
         print(f"  {a:<9} {m:6.3f}  ({verdict})")
     print()
     return all_ok
 
-
-def main():
-    progs = sys.argv[1:] or PROGRAMS
-    if not os.path.exists(CBWRAP) or not os.path.exists(CBSO):
-        raise SystemExit("backend not built; run backend/build.sh first")
-    os.makedirs(OUT, exist_ok=True)
-    runtime_obj, stub_obj = build_runtime()
-    rows = []
-    for p in progs:
-        res = measure_program(p, runtime_obj, stub_obj)
-        bins = {k: os.path.join(OUT, f"{p}.{k}.bin")
-                for k in ("cb", "mir", "llvm", "cl")}
-        verify_outputs(bins, ARGS[p])
-        runs = measure_interleaved(bins, ARGS[p], 50)
-        for k in ("cb", "mir", "llvm", "cl"):
-            res[k]["run"] = runs[k]
-        rows.append((p, res))
-
-    axes = ("wall", "cpu", "rss", "size", "run_wall", "run_cpu", "run_rss")
-    hdr = (f"{'program':<9} {'be':<5} {'wall_ms':>9} {'cpu_ms':>9} "
-           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu':>9} "
-           f"{'run_rss':>9}")
-    print(hdr)
-    print("-" * len(hdr))
-    for p, res in rows:
-        for k in ("cb", "mir", "llvm", "cl"):
-            r = res[k]
-            print(f"{p:<9} {k:<5} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
-                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f} "
-                  f"{r['run']['cpu']*1000:9.2f} {r['run']['rss']:9.0f}")
-
-    print()
-    all_ok = report_vs(rows, "llvm", "LLVM", axes, flag_losses=True)
-    report_vs(rows, "mir", "printed-MIR prototype (`mir`)", axes)
-    report_vs(rows, "cl", "rustc Cranelift (`cl`)", axes)
-
-    print()
-    print("ALL CB WINS" if all_ok else "some axes lost (cb vs llvm)")
-
-
-if __name__ == "__main__":
-    sys.exit(main())
