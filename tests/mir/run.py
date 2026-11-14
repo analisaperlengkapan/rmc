@@ -69,6 +69,23 @@ ARGS = {
     # each of the three bounds, so the zero-trip guard and the fold are both hit.
     "loopcount": [["0", "0", "0"], ["1", "1", "1"], ["5", "-3", "9"], ["1000", "7", "-1"]],
     "loopneg": [["0"], ["1"], ["6"], ["-4"]],
+    # `[v; n]` with byte, word and multi-word elements, read at runtime indices.
+    "repeatelem": [["10", "0"], ["-3", "5"], ["7", "3"]],
+    # Realistic workloads, at small sizes. Each one found a back-end bug: a
+    # constant-left `-` (nqueens), an `&mut [T; N]` parameter written after
+    # inlining (fannkuch, matmul), a memory-to-memory `cmp` (sort), duplicate
+    # local labels across functions (vm), and an 8-byte `[0u8; N]` splat
+    # (textparse).
+    "real_vm": [["200"], ["1"]],
+    "real_sort": [["2"]],
+    "real_hashmap": [["20000"]],
+    "real_bfs": [["2"]],
+    "real_life": [["30"]],
+    "real_nqueens": [["8"], ["1"]],
+    "real_fannkuch": [["7"]],
+    "real_matmul": [["2"]],
+    "real_textparse": [["3"]],
+    "real_particles": [["100"]],
     # float accumulates `n` half-steps; run the empty and non-empty loops.
     "float": [["0"], ["1"], ["5"], ["9"]],
     # resenum builds a `Result` at runtime: n > 0 takes `Ok`, n <= 0 takes
@@ -163,9 +180,11 @@ def build_reference(name, rt):
     ])
     if rc != 0:
         return None, f"rustc failed:\n{err.decode(errors='replace')}"
-    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt]
-    if overflow_checks(name):
-        link.append(overflow_stubs(obj))
+    # Every case, not only the `.overflow` ones: a runtime index keeps a
+    # `panic_bounds_check` call in the reference even with overflow checks
+    # off, and its mangled name is toolchain-specific, so it is stubbed from
+    # the object's own `nm -u` like the overflow entries.
+    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt, overflow_stubs(obj)]
     link += ["-o", ref]
     rc, _, err = run(link)
     if rc != 0:
