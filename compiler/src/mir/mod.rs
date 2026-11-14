@@ -7190,20 +7190,29 @@ pub(crate) fn successors(t: &Terminator) -> Vec<u32> {
 /// Block-level reachability: `reach[i][j]` when block `i` can reach block `j`
 /// by any path, as the transitive closure of the successor relation.
 pub(crate) fn block_reachability(succ: &[Vec<u32>]) -> Vec<Vec<bool>> {
+    // `reach[i][j]` is true when a path of one or more edges leads from block
+    // `i` to block `j` (so `reach[i][i]` means `i` is on a cycle). A depth-first
+    // search from each block's successors computes it in O(n * (n + e)). The
+    // Floyd-Warshall closure this replaces was O(n^3): a function of 2 000
+    // blocks (a `main` with 2 000 calls) spent seconds here.
     let n = succ.len();
     let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
-    for (i, s) in succ.iter().enumerate() {
-        for &t in s {
-            reach[i][t as usize] = true;
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, row) in reach.iter_mut().enumerate() {
+        stack.clear();
+        for &t in &succ[i] {
+            let t = t as usize;
+            if !row[t] {
+                row[t] = true;
+                stack.push(t);
+            }
         }
-    }
-    for k in 0..n {
-        for i in 0..n {
-            if reach[i][k] {
-                for j in 0..n {
-                    if reach[k][j] {
-                        reach[i][j] = true;
-                    }
+        while let Some(k) = stack.pop() {
+            for &t in &succ[k] {
+                let t = t as usize;
+                if !row[t] {
+                    row[t] = true;
+                    stack.push(t);
                 }
             }
         }
@@ -7345,6 +7354,34 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DFS reachability matches the transitive closure it replaced,
+    /// including self-reachability through a cycle and unreachable blocks.
+    #[test]
+    fn block_reachability_is_the_transitive_closure() {
+        let succ: Vec<Vec<u32>> = vec![vec![1], vec![2, 4], vec![1], vec![3], vec![]];
+        let r = block_reachability(&succ);
+        let n = succ.len();
+        let mut want = vec![vec![false; n]; n];
+        for (i, s) in succ.iter().enumerate() {
+            for &t in s {
+                want[i][t as usize] = true;
+            }
+        }
+        for k in 0..n {
+            for i in 0..n {
+                if want[i][k] {
+                    for j in 0..n {
+                        if want[k][j] {
+                            want[i][j] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(r, want);
+        assert!(r[1][1] && r[2][2] && r[3][3] && !r[0][0] && !r[4][4]);
+    }
 
     #[test]
     fn float_arithmetic_is_not_reported_unsupported() {

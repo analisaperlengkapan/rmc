@@ -39,6 +39,14 @@ fn main() {
     // message and status 1, not a panic and a backtrace note. `tools/fuzz.py`
     // and the differential suite both rely on "unsupported" being a status, not
     // a crash.
+    // `RMC_TIME=1` prints parse, each MIR pass, codegen and assembly times.
+    let timing = std::env::var_os("RMC_TIME").is_some();
+    let phase = |label: &str, t: std::time::Instant| {
+        if timing {
+            eprintln!("{label:>24} {:8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    };
+    let t = std::time::Instant::now();
     let mut prog = match rmc::mir::parse_with(&text, overflow_checks) {
         Ok(p) => p,
         Err(e) => {
@@ -48,10 +56,14 @@ fn main() {
     };
     // The same pass list as `rmc --rustc-frontend` and the codegen backend;
     // `RMC_TIME=1` prints per-pass timings.
+    phase("parse", t);
     let mo = rmc::MirOptions { overflow_checks, ..rmc::MirOptions::default() };
     rmc::optimize_mir(&mut prog, &mo);
+    let t = std::time::Instant::now();
     match rmc::compile_mir_to_asm(&prog, &opts) {
         Ok(asm) => {
+            phase("codegen", t);
+            let t = std::time::Instant::now();
             if emit_asm {
                 print!("{asm}");
                 return;
@@ -66,6 +78,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            phase("assemble", t);
             if let Err(e) = std::fs::write(&output, &bytes) {
                 let _ = writeln!(std::io::stderr(), "rmc-mir: error: cannot write {}: {e}", output.display());
                 std::process::exit(1);

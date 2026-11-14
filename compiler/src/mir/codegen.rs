@@ -6193,11 +6193,23 @@ fn optimize(body: &str) -> String {
     let trace = std::env::var_os("RMC_TRACE_PEEPHOLE").is_some();
     // `RMC_SKIP_PEEPHOLE=a,b` skips the named passes, to bisect a miscompile.
     let skip = std::env::var("RMC_SKIP_PEEPHOLE").unwrap_or_default();
+    // `RMC_TIME=1` also reports any peephole pass that takes over a millisecond
+    // on one function, with the function's size, to find a quadratic pass.
+    let timing = std::env::var_os("RMC_TIME").is_some();
     let step = |name: &str, f: fn(&str) -> String, body: String| -> String {
         if skip.split(',').any(|s| s.trim() == name) {
             return body;
         }
+        let t = std::time::Instant::now();
         let out = f(&body);
+        if timing && t.elapsed().as_secs_f64() > 1e-3 {
+            eprintln!(
+                "{:>24} {:8.1} ms  ({} lines)",
+                format!("peephole:{name}"),
+                t.elapsed().as_secs_f64() * 1000.0,
+                body.lines().count()
+            );
+        }
         if trace && out != body {
             eprintln!("--- peephole: {name}\n{out}");
         }
