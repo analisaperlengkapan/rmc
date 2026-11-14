@@ -2161,7 +2161,12 @@ impl<'a> FnGen<'a> {
                 continue;
             }
             if let Stmt::Assign(p, rv) = s {
-                self.gen_assign(p, rv)?;
+                // Name the function, block and statement on failure: a bare
+                // "aggregate constant unsupported" gives no way back to the
+                // MIR line that caused it.
+                self.gen_assign(p, rv).map_err(|e| {
+                    format!("{e}\n  in `{}` bb{bb}, statement {i}: {p:?} = {rv:?}", self.func.name)
+                })?;
             }
         }
         self.gen_term(bb, &term)
@@ -6163,7 +6168,12 @@ fn optimize(body: &str) -> String {
     // `RMC_TRACE_PEEPHOLE=1` prints every pass that changed the body to stderr,
     // so a miscompile can be bisected to the rewrite that introduced it.
     let trace = std::env::var_os("RMC_TRACE_PEEPHOLE").is_some();
+    // `RMC_SKIP_PEEPHOLE=a,b` skips the named passes, to bisect a miscompile.
+    let skip = std::env::var("RMC_SKIP_PEEPHOLE").unwrap_or_default();
     let step = |name: &str, f: fn(&str) -> String, body: String| -> String {
+        if skip.split(',').any(|s| s.trim() == name) {
+            return body;
+        }
         let out = f(&body);
         if trace && out != body {
             eprintln!("--- peephole: {name}\n{out}");
