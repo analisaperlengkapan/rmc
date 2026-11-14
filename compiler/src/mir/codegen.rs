@@ -5651,9 +5651,16 @@ fn coalesce_scratch(body: &str) -> String {
             // (`dead`). A call result is the common case -- `%rax` holds it and
             // the generator copies it into a callee-saved register so the next
             // call can overwrite `%rax`.
-            let (keep, dead) = if SCRATCH.contains(&t) && !SCRATCH.contains(&a) {
-                (a, t)
-            } else if SCRATCH.contains(&a) && !SCRATCH.contains(&t) {
+            //
+            // Only the copy *out of* a scratch register qualifies. For a copy
+            // *into* one (`mov %r14, %rcx; imul %rcx`) the region names the
+            // scratch register, the value lives in the source, and deleting the
+            // `mov` while renaming the source to the scratch register left
+            // `imul %rcx` reading whatever `%rcx` held. That fired whenever the
+            // source had no other mention in the body, as a hoisted constant
+            // loaded in the prologue does: `x % 1000003` in a loop returned
+            // garbage.
+            let (keep, dead) = if SCRATCH.contains(&a) && !SCRATCH.contains(&t) {
                 (t, a)
             } else {
                 out.push_str(lines[i]);
@@ -7626,6 +7633,23 @@ fn f(_1: &[i64; 8], _2: i64) -> i64 {
         // The success path reaches the load without passing an exit syscall.
         let load = f[check..].find("mov (%").map(|o| o + check).expect("load");
         assert!(!f[check..load].contains("syscall"), "{f}");
+    }
+
+    /// A copy *into* a scratch register is not coalesced: the value lives in
+    /// the source, so deleting the copy leaves the scratch register stale.
+    #[test]
+    fn a_copy_into_a_scratch_register_is_kept() {
+        let body = "  mov %rdi, %rax\n  mov %r14, %rcx\n  imul %rcx\n  mov %rdx, %rax\n";
+        assert_eq!(coalesce_scratch(body), body);
+    }
+
+    /// A copy *out of* a scratch register still is: `%rax` holds the value
+    /// already, so the region can read it there.
+    #[test]
+    fn a_copy_out_of_a_scratch_register_is_coalesced() {
+        let body = "  mov %rax, %rbx\n  mov %rbx, %rdi\n  mov $0, %rax\n  call f\n";
+        let out = coalesce_scratch(body);
+        assert_eq!(out, "  mov %rax, %rdi\n  mov $0, %rax\n  call f\n");
     }
 
     #[test]
