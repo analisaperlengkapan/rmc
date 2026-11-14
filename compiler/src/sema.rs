@@ -1415,7 +1415,19 @@ impl Sema {
     /// rewrites a repeat literal to a block so it has an address.
     fn check_let_init(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         if let Expr::ArrayLit(val, n) = e {
-            let t = self.check_expr(val, scope)?;
+            // The repeated value takes the declared element width, as a list
+            // literal's elements do: `let b: [u8; 24] = [0; 24]` types the `0`
+            // as `u8`. Without this the literal stayed `i64` and the `let` was
+            // rejected as `[i64; 24]` vs `[u8; 24]`.
+            let saved_int = self.expected_int.take();
+            if let Some(t) = &self.expected_elem_int {
+                if is_int_ty(t) {
+                    self.expected_int = Some(t.clone());
+                }
+            }
+            let t = self.check_expr(val, scope);
+            self.expected_int = saved_int;
+            let t = t?;
             if !t.is_array_elem() {
                 return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {t:?}"));
             }
