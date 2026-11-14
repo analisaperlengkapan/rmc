@@ -4630,7 +4630,7 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  mov %rax, {}", self.off(ptr)));
                 self.emit(&format!("  movq $0, {}", self.off(i)));
                 self.emit(&format!("{loop_lbl}:"));
-                self.emit(&format!("  cmp ${n}, {}", self.off(i)));
+                self.emit(&format!("  cmpq ${n}, {}", self.off(i)));
                 self.emit(&format!("  jge {done}"));
                 self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
                 self.emit(&format!("  mov {}, %rdx", self.off(i)));
@@ -4686,7 +4686,7 @@ impl<'a> FnGen<'a> {
                 let done = self.new_label();
                 self.emit(&format!("  movq $0, {}", self.off(i)));
                 self.emit(&format!("{loop_lbl}:"));
-                self.emit(&format!("  cmp ${n}, {}", self.off(i)));
+                self.emit(&format!("  cmpq ${n}, {}", self.off(i)));
                 self.emit(&format!("  jge {done}"));
                 self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
                 self.emit(&format!("  mov {}, %rdx", self.off(i)));
@@ -6201,7 +6201,38 @@ fn optimize(body: &str) -> String {
         body = step("drop_unread_stores", drop_unread_stores, body);
         body = step("drop_noop_arith", drop_noop_arith, body);
     }
-    step("interleave_div_pairs", interleave_div_pairs, body)
+    let body = step("interleave_div_pairs", interleave_div_pairs, body);
+    step("suffix_imm_mem", suffix_imm_mem, body)
+}
+
+/// Give every immediate-to-memory ALU instruction an explicit 64-bit suffix.
+///
+/// `cmp $32, -472(%rbp)` names no register, so GNU `as` cannot infer a width
+/// and picks 32 bits (`cmpl`), while the in-process encoder encodes it with
+/// REX.W. The two link paths then disagreed: under `--binutils` a bounds check
+/// compared only the low half of a 64-bit index. The peepholes create these
+/// forms (folding a register load into the instruction), so the suffix is added
+/// once, after every rewrite has run, rather than taught to each pass.
+/// `mov $imm, mem` is left alone: its unsuffixed width is 32 bits in both
+/// assemblers, and the generator sizes those stores itself.
+fn suffix_imm_mem(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 64);
+    for line in body.lines() {
+        let t = line.trim_start();
+        let indent = &line[..line.len() - t.len()];
+        let rewritten = t.split_once(' ').and_then(|(op, rest)| {
+            let alu = matches!(op, "add" | "sub" | "and" | "or" | "xor" | "cmp");
+            let (src, dst) = rest.split_once(',')?;
+            (alu && src.trim().starts_with('$') && dst.trim().ends_with(')'))
+                .then(|| format!("{indent}{op}q {rest}"))
+        });
+        match rewritten {
+            Some(l) => out.push_str(&l),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Interleave two adjacent `mul`/`div`-by-constant units so the two long
@@ -7054,6 +7085,18 @@ fn main() -> () {
         crate::mir::layout_blocks(&mut prog);
         let asm = compile(&prog, &Options::default()).expect("compile");
         assert!(asm.contains("main:"), "main not emitted:\n{asm}");
+    }
+
+    /// An immediate-to-memory ALU op names no register, so `as` would pick a
+    /// 32-bit width; the in-process encoder uses 64. The suffix makes both
+    /// agree. Register forms and `mov` are untouched.
+    #[test]
+    fn an_immediate_to_memory_alu_op_gets_a_q_suffix() {
+        let body = "  cmp $32, -472(%rbp)\n  add $8, (%rax)\n  cmp $3, %rax\n  mov $0, -8(%rbp)\n";
+        assert_eq!(
+            suffix_imm_mem(body),
+            "  cmpq $32, -472(%rbp)\n  addq $8, (%rax)\n  cmp $3, %rax\n  mov $0, -8(%rbp)\n"
+        );
     }
 
     /// `mov $k, %t; sub %s, %t` is `k - s`. No `lea` displacement expresses
