@@ -179,7 +179,8 @@ The tuned set overstates rmc's code quality: on held-out code the MIR back end
 is about half as fast as LLVM and slower than Cranelift. The causes measured
 in the generated code are register allocation (five callee-saved registers,
 loop-carried values in memory), no `cmov`, no induction-variable strength
-reduction, and per-iteration bounds checks.
+reduction, and per-iteration bounds checks. Section 9 is the round of work
+that followed, and its numbers.
 
 ## 8. Coverage
 
@@ -197,6 +198,79 @@ iterating an array (`<[T; N] as IntoIterator>`), every `Vec` (a `Layout`
 constant it cannot materialise), non-scalar formatting, closures passed as
 values and `dyn Trait`. These share one cause, the text interface that sees
 only the local crate's MIR (`ROADMAP.md`, section 2).
+
+## 9. Second round: run-time code quality
+
+The goal was the held-out gap: the MIR back end ran at 0.52x LLVM on
+`bench/real`. Each change was measured by compiling the *same* dumped MIR with
+`rmcmir` before and after (min of 9 or more interleaved runs per program, on
+one host), and judged on both sets. Most of this round ran on an Intel Xeon
+family 6 model 173 (2.3 GHz); the session then moved to a model 207 (2.1 GHz),
+where every figure below was re-measured. Programs under ~5 ms (`fib`,
+`stats`, `light`, `heap`) move 5-15% with code placement alone.
+
+### Defects found on the way
+
+Every one was wrong output or a memory-unsafe read with exit status 0, and
+every one was present before this round. Each fix carries a test that fails
+without it.
+
+| # | symptom | root cause | test |
+|---|---|---|---|
+| 1 | `a[-1 as usize]` read the word before the array instead of panicking; every comparison of negative floats in a branch was inverted; `NaN < x` was true | a comparison folded into a branch always used signed `jcc`, and compared floats as integer bit patterns | `tests/mir/bigindex`, `tests/mir/cmpkinds` |
+| 2 | `t[d]` read `t[1005]` of a 16-element array after `d = get(v)`, or after `*(&mut d) = v` | bounds-check elimination kept `d = x & 15`'s bound across a call writing `d` and across a write through a pointer to `d` | `tests/mir/stalefacts`, 2 unit tests |
+| 3 | a loop computing `x % 1000003` returned garbage | `coalesce_scratch` deleted `mov %r14, %rcx` before `imul %rcx`, renaming the wrong register | `tests/std/hoisted_magic`, 2 unit tests |
+| 4 | a division panicked with "overflow" on ordinary values | the overflow check's comparisons were folded into the branch and dropped, while rustc's GVN reused one of them for a later division's check | `tests/std/fuzz_mir_21_33` (found by `fuzz.py --mode mir --seed 21`) |
+| 5 | the in-process assembler panicked on a float comparison | `setp`/`setnp` were dispatched to the `setcc` encoder but not encoded | unit test |
+
+Number 4 surfaced only once registers were shared: the never-stored `bool`
+used to sit in a register that happened to hold 0. Number 3 already failed at
+the start of the round but no test reached it; an experiment that allocated
+every local through the interference graph exposed it in `light` and
+`particles`, which argues for running the suites under deliberately unusual
+allocations (`ROADMAP.md`, section 1). The MIR fuzzer generates only `i64`
+values, which is why it never found number 1.
+
+Open, not fixed: rmc's own front end treats `u64`/`usize` as `i64` (a
+documented deviation), so comparisons and divisions of values at or above 2^63
+differ from rustc.
+
+### What changed
+
+| change | effect, same MIR, before -> after |
+|---|---|
+| register sharing: an interference graph from statement-level liveness, so locals whose lifetimes never overlap share a register | `vm`, `sort`, `hashmap`, `fannkuch`, `matmul` 1.3-1.5x |
+| one priority order for every local and constant, uses x 8^loop-depth (was linear, with every loop's counters first) | `bfs` 1.66x, `matmul` 1.15x, `textparse` 1.11x |
+| an argument no call outlives stays in its incoming register; a value live across a call takes only a callee-saved register | `life` 1.20x; `nqueens` regression avoided |
+| branches and fused compare+branch kept off 32-byte boundaries (in-process and `--binutils`) | `heavy` 4.15x, and loop speed no longer depends on where it lands |
+| constant shift counts as immediates; one addressing mode for an element through a pointer; bounds-check failures branch out of line | fewer instructions per access and per check |
+| `mov %a, %d; sub $k, %d` folded to `lea` | `callrec` 1.14x |
+
+Measured together against the start of the round on the model 207 host,
+same MIR: `real` 1.31x faster, `core` 1.14x.
+
+### Where it stands
+
+From [`bench/RESULTS-4WAY.md`](../bench/RESULTS-4WAY.md), model 207 host,
+LLVM time / pipeline time:
+
+| | `core` (tuned) | `real` (held out) |
+|---|---:|---:|
+| rustc + rmc back end vs LLVM | 1.13 | **0.69** |
+| rmc front end + back end vs LLVM | 0.97 | 0.63 |
+| rustc + Cranelift vs LLVM | 0.81 | 0.71 |
+| rustc + rmc back end vs Cranelift | 1.39 | 0.97 |
+
+The `core` figure includes `forloops`, where LLVM is 2.5x slower than rmc;
+without it the MIR back end is at about 1.05x LLVM. On held-out code it is
+now level with Cranelift. The programs still far behind LLVM are `bfs` (0.49),
+`life` (0.45) and `particles` (0.50): loops with more live values than the
+nine allocatable registers, where a value the inner loop never touches still
+holds a register through it. Three re-weightings of the allocator were
+measured and each moved the loss between programs; live-range splitting is the
+next step (`ROADMAP.md`, section 4). A range analysis that removes `life`'s
+bounds checks works but made `life` slower until then, because the index lost
+its second use and with it its register.
 
 ## Reproducing
 

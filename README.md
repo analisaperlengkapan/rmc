@@ -11,40 +11,45 @@ no assembler or linker process. It has two front ends sharing one back end:
 
 It is a research compiler. It is fast to build with and produces tiny
 binaries; it compiles a fraction of real Rust, and on code it was not tuned for
-its output runs well behind LLVM's. [`docs/AUDIT.md`](docs/AUDIT.md) has the
+its output runs at about two thirds of LLVM's speed, on par with Cranelift's. [`docs/AUDIT.md`](docs/AUDIT.md) has the
 measured state and [`docs/ROADMAP.md`](docs/ROADMAP.md) the plan.
 
 ## Where it stands
 
-Measured on one Intel Xeon (details and raw tables in `bench/RESULTS-*.md`,
-method in `docs/AUDIT.md`). Every pipeline compiles the *same* source.
+Measured on one Intel Xeon (2.1 GHz, family 6 model 207; raw tables in
+`bench/RESULTS-*.md`, method in `docs/AUDIT.md`). Every pipeline compiles the
+*same* source.
 
 **Build time** (one build, generated programs; [`RESULTS-SCALE.md`](bench/RESULTS-SCALE.md)):
 
 | lines | rmc | rustc + rmc back end | rustc + Cranelift | rustc + LLVM -O0 | rustc + LLVM -O3 | rustc type-check only |
 |---:|---:|---:|---:|---:|---:|---:|
-| 973 | **14 ms** | 210 ms | 67 ms | 61 ms | 139 ms | 42 ms |
-| 9 253 | **127 ms** | 1 063 ms | 412 ms | 391 ms | 1 469 ms | 248 ms |
-| 46 053 | **1 231 ms** | 6 108 ms | 2 029 ms | 1 826 ms | 14 301 ms | 1 121 ms |
+| 973 | **13 ms** | 205 ms | 85 ms | 76 ms | 158 ms | 65 ms |
+| 9 253 | **115 ms** | 1 029 ms | 406 ms | 428 ms | 1 559 ms | 249 ms |
+| 46 053 | **1 476 ms** | 6 472 ms | 2 702 ms | 2 233 ms | 16 753 ms | 1 182 ms |
 
 rmc's own front end builds a program in about the time rustc needs just to
-type-check it: 10-12x faster than an LLVM release build and 1.5-5x faster than
+type-check it: 11-14x faster than an LLVM release build and 1.5-6x faster than
 a debug build. The rustc + rmc route is not a fast-compile route yet: it is
-faster than LLVM -O3 only on large programs and about 3x slower than Cranelift
-or LLVM -O0, because its back end works on assembly text.
+faster than LLVM -O3 only on large programs and about 2.5x slower than
+Cranelift or LLVM -O0, because its back end works on assembly text.
 
 **Run time** (geometric mean of LLVM time / pipeline time, so below 1 is
 slower than LLVM; [`RESULTS-4WAY.md`](bench/RESULTS-4WAY.md)):
 
 | | 12 programs rmc was tuned on | 10 held-out realistic programs |
 |---|---:|---:|
-| rustc + rmc back end | 0.91 | 0.52 |
-| rmc front end + back end | 0.88 | 0.63 |
-| rustc + Cranelift | 0.75 | 0.69 |
+| rustc + rmc back end | 1.13 | **0.69** |
+| rmc front end + back end | 0.97 | 0.63 |
+| rustc + Cranelift | 0.81 | 0.71 |
 
-On the programs it was tuned for, rmc's code is within about 10% of LLVM's and
-ahead of Cranelift's; on held-out code it is roughly half as fast as LLVM and
-behind Cranelift.
+On the programs it was tuned for, rmc's code matches LLVM's and beats
+Cranelift's (the tuned geometric mean includes `forloops`, where LLVM is 2.5x
+slower; without it the MIR back end is at about 1.05). On held-out code the
+MIR back end runs at 0.69x LLVM, up from 0.52x before its second round of
+work, and at 0.97x Cranelift: register pressure in loops with many live values
+(`bfs`, `life`, `particles` at about 0.5x) is the remaining gap
+(`docs/AUDIT.md`, section 9).
 
 **Binary size**: a few hundred bytes to a few kB, against ~17 kB for the same
 `no_std` program through LLVM (the runtime keeps only the pieces a program
@@ -163,9 +168,12 @@ percent between runs and hosts.
 * Language: the subset in `docs/language.md` for rmc's front end; for the rustc
   route, what the local crate's MIR can express without generic `std` code (no
   `Vec`, iterator adapters, closures as values, `dyn Trait`, `env::args`).
-* Code quality: no general register allocator, no `cmov`, no induction-variable
-  strength reduction; held-out code runs at roughly half to two thirds of
-  LLVM's speed.
+* Code quality: the register allocator shares registers by interference but
+  does not split live ranges, and only nine registers are allocatable; no
+  `cmov`, no induction-variable strength reduction. Held-out code runs at
+  about two thirds of LLVM's speed.
+* rmc's own front end treats `u64`/`usize` as `i64` (`docs/language.md`), so a
+  comparison or division of values at or above 2^63 differs from rustc.
 * rmc's front end stores each array element in an 8-byte slot, so a large local
   byte array can exceed the stack; it is rejected with a message.
 * x86-64 Linux only.
