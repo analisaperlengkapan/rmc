@@ -2196,7 +2196,20 @@ impl<'a> FnGen<'a> {
         // comparisons into the terminator, so all three are dead.
         if matches!(term, Terminator::Assert { negate: true, .. }) {
             if let Some((ai, c1i, c2i)) = self.and_chain(bb, pl.local) {
-                if !self.local_used_elsewhere(bb, pl.local) {
+                // Every folded statement's result must be dead elsewhere, the
+                // comparisons' as well as the `and`'s: rustc's GVN reuses a
+                // comparison (`_90 = Eq(x, i64::MIN)`) for a later overflow
+                // check of another division by the same value, and that later
+                // block then read a `bool` that was never stored.
+                let cmp_local = |i: usize| match &block.stmts[i] {
+                    Stmt::Assign(p, _) => Some(p.local),
+                    Stmt::Nop => None,
+                };
+                let c_dead = [c1i, c2i].iter().all(|&i| match cmp_local(i) {
+                    Some(l) => !self.local_used_elsewhere_except(bb, l, Some(ai)),
+                    None => false,
+                });
+                if c_dead && !self.local_used_elsewhere(bb, pl.local) {
                     return vec![ai, c1i, c2i];
                 }
             }
@@ -2232,12 +2245,27 @@ impl<'a> FnGen<'a> {
     /// both folds bail, and the `bool` materialisation (`setl`/`movzbl`/store)
     /// was paid on every loop iteration.
     fn local_used_elsewhere(&self, bb: u32, local: u32) -> bool {
+        self.local_used_elsewhere_except(bb, local, None)
+    }
+
+    /// `local_used_elsewhere`, not counting the reads of statement `except`
+    /// of `bb` (the `and` of an overflow check reads both comparisons, and the
+    /// fold serves exactly that read), and counting a read by `bb`'s own
+    /// terminator when `except` is given (a comparison result the terminator
+    /// reads directly is not one the `and` fold serves).
+    fn local_used_elsewhere_except(&self, bb: u32, local: u32, except: Option<usize>) -> bool {
         for (b, block) in self.func.blocks.iter().enumerate() {
             // In `bb` itself the fold removes one statement, so any read of the
             // local there - before the comparison (the old value) or after it
             // (the folded value) - is a read the fold cannot serve.
             if b as u32 == bb {
-                for s in &block.stmts {
+                if except.is_some() && terminator_reads(&block.term, local) {
+                    return true;
+                }
+                for (i, s) in block.stmts.iter().enumerate() {
+                    if Some(i) == except {
+                        continue;
+                    }
                     let mut used = false;
                     scan_operands(s, &mut |op| {
                         if let Operand::Copy(p) | Operand::Move(p) = op {
