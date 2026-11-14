@@ -418,72 +418,87 @@ impl Elf {
             .collect();
         al.sort_by_key(|(s, o, _, ord)| (*s, *o, *ord));
 
-        // Padding inserted at `o` moves a definition at the same offset only
-        // when the padding comes first in the source (`pad_ord < ord`).
-        // `PAD_BEFORE`/`PAD_AFTER` place a pad at an instruction's start/end on
-        // the correct side of it.
-        let inserted_before = |pts: &[(i64, i64, u64)], o: i64, ord: u64| -> i64 {
-            pts.iter()
-                .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
-                .map(|(_, a, _)| *a)
-                .sum()
-        };
+        // Removals and paddings are kept sorted by position with prefix sums,
+        // so "how much was removed/inserted before offset `o`" is a binary
+        // search rather than a scan. The scans made relaxation quadratic: a
+        // 46k-line program spent 28 s of a 29 s compile here.
+        //
+        // A removal at `e` takes bytes that lie before `e`, so it shifts `e`
+        // itself (`<=`). Padding inserted at `o` moves a definition at the same
+        // offset only when the padding comes first in the source
+        // (`pad_ord < ord`); `PAD_BEFORE`/`PAD_AFTER` place a pad at an
+        // instruction's start/end on the correct side of it.
+        struct Shift {
+            rem_at: Vec<i64>,
+            rem_sum: Vec<i64>,
+            pad_at: Vec<(i64, u64)>,
+            pad_len: Vec<i64>,
+            pad_sum: Vec<i64>,
+        }
+        impl Shift {
+            fn removed_before(&self, o: i64) -> i64 {
+                self.rem_sum[self.rem_at.partition_point(|&e| e <= o)]
+            }
+            fn inserted_before(&self, o: i64, ord: u64) -> i64 {
+                self.pad_sum[self.pad_at.partition_point(|&(e, pord)| (e, pord) < (o, ord))]
+            }
+            /// How far an original offset moves: down by the removals before
+            /// it, up by the padding inserted before it.
+            fn net(&self, o: i64, ord: u64) -> i64 {
+                self.removed_before(o) - self.inserted_before(o, ord)
+            }
+        }
         // The layout implied by `short`: the bytes each shortened branch
         // removes, and the padding each align point then needs.
-        let compute = |short: &[bool]| -> (Vec<Vec<(i64, i64)>>, Vec<Vec<(i64, i64, u64)>>) {
-            let mut rem = vec![Vec::new(); nsec];
+        let compute = |short: &[bool]| -> Vec<Shift> {
+            let mut out: Vec<Shift> = (0..nsec)
+                .map(|_| Shift {
+                    rem_at: Vec::new(),
+                    rem_sum: vec![0],
+                    pad_at: Vec::new(),
+                    pad_len: Vec::new(),
+                    pad_sum: vec![0],
+                })
+                .collect();
+            // `order` is sorted by end offset, so each section's removals arrive
+            // in position order.
             for b in 0..n {
                 if short[b] {
-                    rem[sec_of[b]].push((orig_end[b], orig_len[b] - 2));
+                    let sh = &mut out[sec_of[b]];
+                    sh.rem_at.push(orig_end[b]);
+                    let last = *sh.rem_sum.last().unwrap();
+                    sh.rem_sum.push(last + orig_len[b] - 2);
                 }
             }
-            // A removal at `e` takes bytes that lie before `e`, so it shifts
-            // `e` itself and counts with `<=`. Padding lands after whatever is
-            // already at its offset; whether it moves a given definition at the
-            // same offset is decided by `ord` in `net`.
-            let removed_before = |pts: &[(i64, i64)], o: i64| -> i64 {
-                pts.iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum()
-            };
-            let mut pads: Vec<Vec<(i64, i64, u64)>> = vec![Vec::new(); nsec];
+            // `al` is sorted by (section, offset, ord), so each pad is placed
+            // after every pad that precedes it.
             for &(sec, o, a, ord) in &al {
-                let pos = o - removed_before(&rem[sec], o) + inserted_before(&pads[sec], o, ord);
+                let sh = &mut out[sec];
+                let pos = o - sh.removed_before(o) + sh.inserted_before(o, ord);
                 let pad = (a - pos.rem_euclid(a)) % a;
                 if pad > 0 {
-                    pads[sec].push((o, pad, ord));
+                    sh.pad_at.push((o, ord));
+                    sh.pad_len.push(pad);
+                    let last = *sh.pad_sum.last().unwrap();
+                    sh.pad_sum.push(last + pad);
                 }
             }
-            (rem, pads)
+            out
         };
-        // How far an original offset moves: down by the removals before it, up
-        // by the padding inserted before it.
-        let net = |rem: &[Vec<(i64, i64)>],
-                   pads: &[Vec<(i64, i64, u64)>],
-                   sec: usize,
-                   o: i64,
-                   ord: u64|
-         -> i64 {
-            let rm: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
-            let ins: i64 = inserted_before(&pads[sec], o, ord);
-            rm - ins
-        };
-        let disp = |rem: &[Vec<(i64, i64)>],
-                    pads: &[Vec<(i64, i64, u64)>],
-                    short: &[bool],
-                    b: usize|
-         -> Option<i64> {
+        let disp = |sh: &[Shift], short: &[bool], b: usize| -> Option<i64> {
             let t0 = target[b]?;
             let sec = sec_of[b];
-            let start = orig_start[b] - net(rem, pads, sec, orig_start[b], PAD_BEFORE);
+            let start = orig_start[b] - sh[sec].net(orig_start[b], PAD_BEFORE);
             let len = if short[b] { 2 } else { orig_len[b] };
-            let t = t0 - net(rem, pads, sec, t0, target_ord[b]);
+            let t = t0 - sh[sec].net(t0, target_ord[b]);
             Some(t - (start + len))
         };
 
         let mut short = vec![false; n];
         for _ in 0..64 {
-            let (rem, pads) = compute(&short);
+            let sh = compute(&short);
             let next: Vec<bool> = (0..n)
-                .map(|b| matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d)))
+                .map(|b| matches!(disp(&sh, &short, b), Some(d) if (-128..=127).contains(&d)))
                 .collect();
             if next == short {
                 break;
@@ -493,11 +508,11 @@ impl Elf {
         // A branch that ends up out of range keeps its rel32 form; the rel32
         // encoding reaches anywhere this compiler emits.
         for _ in 0..64 {
-            let (rem, pads) = compute(&short);
+            let sh = compute(&short);
             let mut changed = false;
             for b in 0..n {
                 if short[b] {
-                    let fits = matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d));
+                    let fits = matches!(disp(&sh, &short, b), Some(d) if (-128..=127).contains(&d));
                     if !fits {
                         short[b] = false;
                         changed = true;
@@ -508,70 +523,88 @@ impl Elf {
                 break;
             }
         }
-        let (rem, pads) = compute(&short);
+        let sh = compute(&short);
 
-        // Splice the shortened branches, furthest along first, so each branch's
-        // start is still at its original offset when it is reached.
-        for b in (0..n).rev() {
+        // Rebuild each section in one pass: a shortened branch keeps its first
+        // byte (rewritten to the short opcode) and its last (the future disp8)
+        // and drops the bytes between; the padding for offset `o` goes in
+        // before the byte originally at `o`, in source order. Splicing each
+        // change into the buffer in place moved the whole tail every time.
+        let mut cuts: Vec<Vec<(usize, usize, u8)>> = vec![Vec::new(); nsec];
+        for b in 0..n {
             if !short[b] {
                 continue;
             }
-            let f = self.fixups[order[b]].clone();
+            let f = &self.fixups[order[b]];
             let short_op = match f.kind {
                 FixKind::Jmp => 0xEBu8,
                 FixKind::Jcc(cc) => cc - 0x10,
                 FixKind::Rel32 => unreachable!("only branches carry a branch id"),
             };
-            let start = orig_start[b] as usize;
-            let d = &mut self.sections[f.sec].data;
-            d[start] = short_op;
-            d.drain(start + 1..start + 1 + (orig_len[b] - 2) as usize);
+            let st = orig_start[b] as usize;
+            cuts[f.sec].push((st, st + 1 + (orig_len[b] - 2) as usize, short_op));
         }
-        // Insert the padding, in address order, tracking what is already in.
         for sec in 0..nsec {
-            for &(o, pad, ord) in &pads[sec].clone() {
-                let removed: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
-                let inserted: i64 = pads[sec]
-                    .iter()
-                    .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
-                    .map(|(_, a, _)| *a)
-                    .sum();
-                let at = (o - removed + inserted) as usize;
-                let fill = if self.sections[sec].flags & 0x1 != 0 {
-                    nop_fill(pad as usize)
-                } else {
-                    vec![0u8; pad as usize]
-                };
-                self.sections[sec].data.splice(at..at, fill);
+            if cuts[sec].is_empty() && sh[sec].pad_at.is_empty() {
+                continue;
             }
+            cuts[sec].sort_unstable();
+            let exec = self.sections[sec].flags & 0x1 != 0;
+            let old = std::mem::take(&mut self.sections[sec].data);
+            let mut data = Vec::with_capacity(old.len() + sh[sec].pad_sum.last().copied().unwrap_or(0) as usize);
+            let (mut ci, mut pi, mut i) = (0usize, 0usize, 0usize);
+            loop {
+                while pi < sh[sec].pad_at.len() && sh[sec].pad_at[pi].0 as usize == i {
+                    let pad = sh[sec].pad_len[pi] as usize;
+                    data.extend(if exec { nop_fill(pad) } else { vec![0u8; pad] });
+                    pi += 1;
+                }
+                if i >= old.len() {
+                    break;
+                }
+                if ci < cuts[sec].len() && cuts[sec][ci].0 == i {
+                    let (st, drop_end, op) = cuts[sec][ci];
+                    data.push(op);
+                    // Bytes `st+1 .. drop_end` go; the next copied byte is the
+                    // branch's last one.
+                    let _ = st;
+                    i = drop_end;
+                    ci += 1;
+                    continue;
+                }
+                data.push(old[i]);
+                i += 1;
+            }
+            if pi != sh[sec].pad_at.len() {
+                // An alignment point inside a shortened branch's bytes: the
+                // directives sit between instructions, so this cannot happen
+                // unless the layout bookkeeping is wrong.
+                return Err("elf: internal error: padding fell inside a relaxed branch".into());
+            }
+            self.sections[sec].data = data;
         }
         // Move every offset to its final place.
         let sections = self.sections.len();
         for sec in 0..sections {
             for sym in self.syms.values_mut() {
                 if sym.sec == sec && !sym.abs {
-                    sym.off =
-                        (sym.off as i64 - net(&rem, &pads, sec, sym.off as i64, sym.ord)) as u64;
+                    sym.off = (sym.off as i64 - sh[sec].net(sym.off as i64, sym.ord)) as u64;
                 }
             }
             for (s, o, _) in self.abs64.iter_mut() {
                 if *s == sec {
-                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                    *o = (*o as i64 - sh[sec].net(*o as i64, PAD_BEFORE)) as usize;
                 }
             }
             for (s, o, _) in self.abs_imm.iter_mut() {
                 if *s == sec {
-                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                    *o = (*o as i64 - sh[sec].net(*o as i64, PAD_BEFORE)) as usize;
                 }
             }
             for fx in self.fixups.iter_mut() {
                 if fx.sec == sec {
-                    fx.disp_off = (fx.disp_off as i64
-                        - net(&rem, &pads, sec, fx.disp_off as i64, PAD_BEFORE))
-                        as usize;
-                    fx.next_off = (fx.next_off as i64
-                        - net(&rem, &pads, sec, fx.next_off as i64, PAD_AFTER))
-                        as usize;
+                    fx.disp_off = (fx.disp_off as i64 - sh[sec].net(fx.disp_off as i64, PAD_BEFORE)) as usize;
+                    fx.next_off = (fx.next_off as i64 - sh[sec].net(fx.next_off as i64, PAD_AFTER)) as usize;
                 }
             }
         }
@@ -581,7 +614,7 @@ impl Elf {
                 continue;
             }
             let sec = sec_of[b];
-            let start = orig_start[b] - net(&rem, &pads, sec, orig_start[b], PAD_BEFORE);
+            let start = orig_start[b] - sh[sec].net(orig_start[b], PAD_BEFORE);
             let fx = &mut self.fixups[order[b]];
             fx.disp_off = start as usize + 1;
             fx.next_off = start as usize + 2;
