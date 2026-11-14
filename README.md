@@ -21,22 +21,30 @@ method in `docs/AUDIT.md`). Every pipeline compiles the *same* source.
 
 **Build time** (one build, generated programs; [`RESULTS-SCALE.md`](bench/RESULTS-SCALE.md)):
 
-| lines | rmc | rustc + rmc back end | rustc + Cranelift | rustc + LLVM -O0 | rustc + LLVM -O3 |
-|---:|---:|---:|---:|---:|---:|
-| ~1 000 | see table | | | | |
+| lines | rmc | rustc + rmc back end | rustc + Cranelift | rustc + LLVM -O0 | rustc + LLVM -O3 | rustc type-check only |
+|---:|---:|---:|---:|---:|---:|---:|
+| 973 | **14 ms** | 210 ms | 67 ms | 61 ms | 139 ms | 42 ms |
+| 9 253 | **127 ms** | 1 063 ms | 412 ms | 391 ms | 1 469 ms | 248 ms |
+| 46 053 | **1 231 ms** | 6 108 ms | 2 029 ms | 1 826 ms | 14 301 ms | 1 121 ms |
 
-rmc's own front end builds a program in about the time rustc's front end alone
-needs to type-check it. The rustc + rmc route pays rustc's front end plus a
-back end that is still slower than Cranelift on large functions.
+rmc's own front end builds a program in about the time rustc needs just to
+type-check it: 10-12x faster than an LLVM release build and 1.5-5x faster than
+a debug build. The rustc + rmc route is not a fast-compile route yet: it is
+faster than LLVM -O3 only on large programs and about 3x slower than Cranelift
+or LLVM -O0, because its back end works on assembly text.
 
 **Run time** (geometric mean of LLVM time / pipeline time, so below 1 is
 slower than LLVM; [`RESULTS-4WAY.md`](bench/RESULTS-4WAY.md)):
 
 | | 12 programs rmc was tuned on | 10 held-out realistic programs |
 |---|---:|---:|
-| rustc + rmc back end | 0.92 | 0.52 |
-| rmc front end + back end | 0.89 | 0.63 |
-| rustc + Cranelift | 0.75 | 0.70 |
+| rustc + rmc back end | 0.91 | 0.52 |
+| rmc front end + back end | 0.88 | 0.63 |
+| rustc + Cranelift | 0.75 | 0.69 |
+
+On the programs it was tuned for, rmc's code is within about 10% of LLVM's and
+ahead of Cranelift's; on held-out code it is roughly half as fast as LLVM and
+behind Cranelift.
 
 **Binary size**: a few hundred bytes to a few kB, against ~17 kB for the same
 `no_std` program through LLVM (the runtime keeps only the pieces a program
@@ -44,8 +52,8 @@ uses).
 
 **Coverage**: of 117 realistic snippets rustc accepts
 ([`tools/mir_survey.py`](tools/mir_survey.py)), rmc's own front end compiles
-66 and the rustc route about 85, with no wrong output; Cranelift compiles all
-117. Neither rmc route compiles idiomatic code built on `Vec`, iterators,
+66 and the rustc route 83, with no wrong output and no crash; Cranelift
+compiles all 117. Neither rmc route compiles idiomatic code built on `Vec`, iterators,
 closures, traits or `String` yet.
 
 ## Building

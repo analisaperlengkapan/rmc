@@ -148,9 +148,18 @@ Two quadratic algorithms, both fixed with byte-identical output:
   rebuild take that build from 1 459 ms to 154 ms; 184 programs assemble to
   identical bytes.
 
-Current scaling: [`bench/RESULTS-SCALE.md`](../bench/RESULTS-SCALE.md). The
-codegen backend's remaining super-linear cost is the text peepholes on long
-function bodies.
+One build, before and after (generated programs; full table in
+[`bench/RESULTS-SCALE.md`](../bench/RESULTS-SCALE.md)):
+
+| lines | rmc before | rmc after | rustc + rmc before | rustc + rmc after | Cranelift | LLVM -O3 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 973 | 26 ms | 14 ms | 263 ms | 210 ms | 67 ms | 139 ms |
+| 9 253 | 1 296 ms | 127 ms | 1 213 ms | 1 063 ms | 412 ms | 1 469 ms |
+| 46 053 | 28 508 ms | 1 231 ms | 15 789 ms | 6 108 ms | 2 029 ms | 14 301 ms |
+
+rmc's own front end is again a fast-compile route (about rustc's type-check
+time). The rustc + rmc route is still about 3x slower than Cranelift; its
+remaining super-linear cost is the text peepholes on long function bodies.
 
 ### Run time
 
@@ -160,10 +169,11 @@ means slower than LLVM):
 
 | | `core` (tuned) | `real` (held out) |
 |---|---:|---:|
-| rustc + rmc back end vs LLVM | 0.92 | **0.52** |
-| rmc front end + back end vs LLVM | 0.89 | **0.63** |
-| rustc + rmc back end vs Cranelift | 1.24 | 0.74 |
-| rmc front end + back end vs Cranelift | 1.54 | 0.89 |
+| rustc + rmc back end vs LLVM | 0.91 | **0.52** |
+| rmc front end + back end vs LLVM | 0.88 | **0.63** |
+| rustc + Cranelift vs LLVM | 0.75 | 0.69 |
+| rustc + rmc back end vs Cranelift | 1.22 | 0.75 |
+| rmc front end + back end vs Cranelift | 1.52 | 0.90 |
 
 The tuned set overstates rmc's code quality: on held-out code the MIR back end
 is about half as fast as LLVM and slower than Cranelift. The causes measured
@@ -179,7 +189,7 @@ idiomatic programs:
 | pipeline | survey: match / refused / wrong | idiomatic programs |
 |---|---|---|
 | rmc's own front end | 66 / 51 / 0 | 0 / 7 |
-| rustc + rmc back end | see `tools/mir_survey.py` output in CI | 0 / 7 |
+| rustc + rmc back end (`--rustc-frontend` and the dylib alike) | 83 / 34 / 0 | 0 / 7 |
 | rustc + Cranelift | 117 / 0 / 0 | 7 / 7 |
 
 The MIR route now accepts `black_box`. It still refuses `std::env::args`,
