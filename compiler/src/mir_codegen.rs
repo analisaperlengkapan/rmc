@@ -3358,6 +3358,43 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// `[agg; count]`: copy the `esize`-byte element `count` times. `copy_words`
+    /// uses `%rax`, `%rcx`, `%r10` and `%r11`, so the source address, the
+    /// running destination and the remaining count live in frame slots.
+    fn gen_repeat_aggregate(
+        &mut self,
+        dest: &Place,
+        op: &Operand,
+        count: u64,
+        esize: i64,
+    ) -> Result<(), String> {
+        let src_slot = self.alloc_slot();
+        let cur_slot = self.alloc_slot();
+        let n_slot = self.alloc_slot();
+        self.eval_aggregate_addr(op)?;
+        let src_off = self.off(src_slot);
+        self.emit(&format!("  mov %rax, {src_off}"));
+        self.place_addr(dest)?;
+        let cur_off = self.off(cur_slot);
+        self.emit(&format!("  mov %rax, {cur_off}"));
+        let n_off = self.off(n_slot);
+        self.emit(&format!("  mov ${count}, %rdx"));
+        self.emit(&format!("  mov %rdx, {n_off}"));
+        let loop_lbl = self.new_label();
+        self.emit(&format!("{loop_lbl}:"));
+        self.emit(&format!("  mov {src_off}, %r10"));
+        self.emit(&format!("  mov {cur_off}, %r11"));
+        self.copy_words(esize);
+        self.emit(&format!("  mov {cur_off}, %r11"));
+        self.emit(&format!("  add ${esize}, %r11"));
+        self.emit(&format!("  mov %r11, {cur_off}"));
+        self.emit(&format!("  mov {n_off}, %rdx"));
+        self.emit("  dec %rdx");
+        self.emit(&format!("  mov %rdx, {n_off}"));
+        self.emit(&format!("  jne {loop_lbl}"));
+        Ok(())
+    }
+
     // --- assignment --------------------------------------------------------
 
     fn gen_assign(&mut self, dest: &Place, rv: &Rvalue) -> Result<(), String> {
@@ -3492,26 +3529,40 @@ impl<'a> FnGen<'a> {
                 self.store_scalar(dest, "%rax")?;
             }
             Rvalue::Repeat { op, count } => {
-                // Materialise the value once, then store it `count` times with a
-                // small runtime loop. The value must survive `place_addr` (which
-                // uses `%rax`), so it lives in a scratch slot; the destination
-                // base address is kept in `%rcx` and the count in `%rdx`.
-                let (src, _) = self.eval_operand(op)?;
-                let tmp = self.alloc_slot();
-                let off = self.off(tmp);
-                self.store_word(&src, &off);
-                self.place_addr(dest)?;
-                self.emit("  mov %rax, %rcx");
-                let val = self.off(tmp);
-                if *count == 0 {
+                // `[v; n]` stores `v` into each of `n` elements of the element's
+                // real size. The loop used to store one 8-byte word with an
+                // 8-byte stride whatever the element was: `[0u8; 1 << 20]`
+                // wrote 8 MiB into a 1 MiB array and ran off the stack (the
+                // `textparse` segfault), and `[S { .. }; n]` initialised only
+                // the first word of each multi-word element.
+                let elem = elem_ty(&self.place_ty(dest));
+                let esize = self.size_of_ty(&elem);
+                if *count == 0 || esize == 0 {
                     // Nothing to store.
+                } else if elem.is_aggregate() {
+                    self.gen_repeat_aggregate(dest, op, *count, esize)?;
                 } else {
+                    // Materialise the value once; it must survive `place_addr`
+                    // (which uses `%rax`), so it lives in a scratch slot. The
+                    // destination address is kept in `%rcx`, the count in `%rdx`.
+                    let (src, _) = self.eval_operand(op)?;
+                    let tmp = self.alloc_slot();
+                    let off = self.off(tmp);
+                    self.store_word(&src, &off);
+                    self.place_addr(dest)?;
+                    self.emit("  mov %rax, %rcx");
+                    let val = self.off(tmp);
                     let loop_lbl = self.new_label();
                     self.emit(&format!("  mov ${count}, %rdx"));
                     self.emit(&format!("  mov {val}, %rax"));
                     self.emit(&format!("{loop_lbl}:"));
-                    self.emit("  mov %rax, (%rcx)");
-                    self.emit("  add $8, %rcx");
+                    if esize == 1 {
+                        self.emit("  mov %al, (%rcx)");
+                        self.emit("  add $1, %rcx");
+                    } else {
+                        self.emit("  mov %rax, (%rcx)");
+                        self.emit(&format!("  add ${esize}, %rcx"));
+                    }
                     self.emit("  dec %rdx");
                     self.emit(&format!("  jne {loop_lbl}"));
                 }
