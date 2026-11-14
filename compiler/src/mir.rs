@@ -2047,6 +2047,17 @@ fn reclassify_enum_aggregate(rv: Rvalue, rhs: &str, dest: &Place, locals: &[Loca
     // variant segment: `Option::<i64>::Some` reduces to `Option::Some` (a
     // variant), `M::G::<i64>` to `M::G` (a struct in module `M`).
     let base = strip_generics(&lit_name);
+    // `core::fmt::rt::ArgumentType` is modelled as the two-word struct of its
+    // `Placeholder` variant (`value`, `formatter`); `Count(n)` is its other
+    // variant, which rustc stores in the `value` niche: word 0 is null and the
+    // count sits in word 1, where the runtime reads it (`8(%rax)`). Treating
+    // `Count(5)` as a one-field struct wrote the 5 into word 0, so `{:1$}` and
+    // `{:.*}` read garbage and printed a truncated line.
+    if base.ends_with("ArgumentType::Count") && ops.len() == 1 {
+        let mut ops = ops;
+        let n = ops.pop().expect("one operand");
+        return Rvalue::Aggregate(vec![Operand::Const(Const::Int(0)), n]);
+    }
     let split = base
         .rsplit_once("::")
         .map(|(p, v)| (p.to_string(), v.to_string()))

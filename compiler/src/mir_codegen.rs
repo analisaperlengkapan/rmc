@@ -3165,7 +3165,7 @@ impl<'a> FnGen<'a> {
         c: &Const,
     ) -> Result<(Vec<i64>, Vec<Ty>, i64, Option<i64>), String> {
         let Const::Agg { name, ops } = c else {
-            return Err("mir_codegen: aggregate constant unsupported".into());
+            return Err(format!("mir_codegen: aggregate constant unsupported: {c:?}"));
         };
         if is_variant_const(name, &self.enums) {
             let (en, v) = split_ev(name);
@@ -3232,7 +3232,7 @@ impl<'a> FnGen<'a> {
     /// struct (or tuple, or array) is laid out rather than stored as a pointer.
     fn write_const_agg(&mut self, c: &Const, base: i64) -> Result<(), String> {
         let Const::Agg { ops, .. } = c else {
-            return Err("mir_codegen: aggregate constant unsupported".into());
+            return Err(format!("mir_codegen: aggregate constant unsupported: {c:?}"));
         };
         let (offs, tys, _size, tag) = self.const_agg_layout(c)?;
         if let Some(tag) = tag {
@@ -3579,7 +3579,13 @@ impl<'a> FnGen<'a> {
                         continue;
                     }
                     field += 1;
-                    if ty.is_aggregate() {
+                    // A one-word aggregate field (`NonNull<T>`, a newtype) fed
+                    // a scalar constant is just that word: `ArgumentType::Count`
+                    // stores a null `value`, and a constant has no address to
+                    // copy from.
+                    let scalar_const = matches!(op, Operand::Const(c) if !matches!(c, Const::Agg { .. }))
+                        && self.place_size(&target) == 8;
+                    if ty.is_aggregate() && !scalar_const {
                         let size = self.place_size(&target);
                         self.eval_aggregate_addr(op)?;
                         self.emit("  mov %rax, %r10");
