@@ -541,7 +541,14 @@ impl Function {
         };
         for b in &self.blocks {
             for s in &b.stmts {
-                if let Stmt::Assign(_, rv) = s {
+                if let Stmt::Assign(dest, rv) = s {
+                    // A destination reads locals too: `(*_p)[0] = x` loads the
+                    // pointer in `_p` to address the store, and `_a[_i] = x`
+                    // reads the index `_i`. Counting only the rvalue let
+                    // `drop_dead_copies` delete `_p = move _3` (an inlined
+                    // `&mut [T; N]` parameter) and store through an
+                    // uninitialised slot.
+                    count_place_reads(dest, &mut uses);
                     scan_rv_operands(rv, &mut |op| read_op(op, &mut uses));
                 }
             }
@@ -550,8 +557,10 @@ impl Function {
                 Terminator::Assert { cond, .. } => read_op(cond, &mut uses),
                 Terminator::Drop { place, .. } => {
                     *uses.entry(place.local).or_insert(0) += 1;
+                    count_place_reads(place, &mut uses);
                 }
-                Terminator::Call { func, args, .. } => {
+                Terminator::Call { dest, func, args, .. } => {
+                    count_place_reads(dest, &mut uses);
                     for a in args.iter().chain(call_callee(func)) {
                         read_op(a, &mut uses);
                     }
@@ -695,6 +704,20 @@ fn written_local(s: &Stmt) -> Option<u32> {
     match s {
         Stmt::Assign(d, _) if d.proj.is_empty() => Some(d.local),
         _ => None,
+    }
+}
+
+/// Record the locals a *written* place reads: its base when the projection
+/// dereferences it (the pointer value addresses the store), and every
+/// dynamic index local. A plain `_d = ..` or `_d.0 = ..` reads nothing.
+fn count_place_reads(p: &Place, uses: &mut HashMap<u32, u32>) {
+    if p.proj.iter().any(|pr| matches!(pr, Proj::Deref)) {
+        *uses.entry(p.local).or_insert(0) += 1;
+    }
+    for pr in &p.proj {
+        if let Proj::IndexLocal(i) = pr {
+            *uses.entry(*i).or_insert(0) += 1;
+        }
     }
 }
 
