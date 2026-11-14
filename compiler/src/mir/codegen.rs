@@ -1449,100 +1449,26 @@ impl<'a> FnGen<'a> {
         if !self.opts.promote {
             return;
         }
-        let mut used: HashSet<&'static str> = HashSet::new();
-        // Loop counters and bounds first: they are touched every iteration.
-        for l in self.loop_operands.clone() {
-            self.promote_local(l, &mut used);
-        }
-        // A value computed before a loop and read inside it is loop-invariant:
-        // keeping it in a register removes a load from every iteration. These
-        // are promoted ahead of the general ranking, because the general count
-        // weighs a value read once per iteration the same as one read once.
-        let depths = self.loop_depths();
-        // A local's definition depth and its deepest use. A local that is only
-        // ever defined above a loop and read inside it is loop-invariant for
-        // that loop: it is worth a register even when a shallower loop holds
-        // the rest of the budget, because it saves a load on every iteration.
-        let mut def_depth: HashMap<u32, u32> = HashMap::new();
-        let mut use_depth: HashMap<u32, u32> = HashMap::new();
-        let mut use_count: HashMap<u32, u32> = HashMap::new();
-        for (bi, b) in self.func.blocks.iter().enumerate() {
-            let d = depths.get(bi).copied().unwrap_or(0);
-            for s in &b.stmts {
-                if let Stmt::Assign(p, rv) = s {
-                    if p.proj.is_empty() {
-                        def_depth
-                            .entry(p.local)
-                            .and_modify(|v| *v = (*v).max(d))
-                            .or_insert(d);
-                    }
-                    let mut lc: HashMap<u32, u32> = HashMap::new();
-                    let mut pj: HashSet<u32> = HashSet::new();
-                    let mut at: HashSet<u32> = HashSet::new();
-                    let mut ix: HashSet<u32> = HashSet::new();
-                    scan_rv(rv, &mut lc, &mut pj, &mut at, &mut ix);
-                    for (l, c) in lc {
-                        use_depth
-                            .entry(l)
-                            .and_modify(|v| *v = (*v).max(d))
-                            .or_insert(d);
-                        *use_count.entry(l).or_insert(0) += c;
-                    }
-                }
-            }
-            let mut lc: HashMap<u32, u32> = HashMap::new();
-            let mut pj: HashSet<u32> = HashSet::new();
-            let mut at: HashSet<u32> = HashSet::new();
-            let mut ix: HashSet<u32> = HashSet::new();
-            scan_term(&b.term, &mut lc, &mut pj, &mut at, &mut ix);
-            for (l, c) in lc {
-                use_depth
-                    .entry(l)
-                    .and_modify(|v| *v = (*v).max(d))
-                    .or_insert(d);
-                *use_count.entry(l).or_insert(0) += c;
-            }
-            if let Terminator::Call { dest, .. } = &b.term {
-                if dest.proj.is_empty() {
-                    def_depth
-                        .entry(dest.local)
-                        .and_modify(|v| *v = (*v).max(d))
-                        .or_insert(d);
-                }
-            }
-        }
-        let mut invariant: Vec<(u32, u32, u32)> = use_depth
-            .iter()
-            .filter(|(l, ud)| **ud > def_depth.get(l).copied().unwrap_or(0))
-            .filter(|(l, _)| !self.promo.contains_key(l))
-            .filter(|(l, _)| !self.ty.get(**l as usize).map(|t| t.is_aggregate()).unwrap_or(false))
-            .map(|(l, ud)| (*l, *ud, use_count.get(l).copied().unwrap_or(1)))
-            .collect();
-        invariant.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        let pool = self.reg_pool();
-        for (l, _, _) in invariant {
-            if self.promo.len() >= pool.len() {
-                break;
-            }
-            self.promote_local(l, &mut used);
-        }
-
-        // Then the hottest remaining scalar locals. A local with a projection
-        // (a struct field, an array element) is left in memory: promoting it
-        // would mean tracking its address, which the cheap rules here do not.
+        // One priority order for every candidate: each scalar local that is
+        // not projected or address-taken, and each wide constant worth keeping
+        // in a register. A use counts 8^depth, so a use in an inner loop
+        // outweighs any number in the loop around it -- a linear weight let
+        // the counters of outer loops, which an inner loop never touches, hold
+        // registers the inner loop's values needed (`bfs` ran 1.7x slower).
         //
-        // A use inside a loop counts more than one outside it, weighted by the
-        // loop's nesting depth: a value carried across a hot loop is worth a
-        // callee-saved register even when it is named less often overall than a
-        // one-shot temporary, which the frame absorbs for free.
-        let mut counts: HashMap<u32, u32> = HashMap::new();
+        // Locals take a register through the interference graph, so two whose
+        // lifetimes never overlap share it (`promote_shared`). A constant is
+        // materialised once at entry and stays for the whole function, so it
+        // takes a register nothing else owns.
+        let depths = self.loop_depths();
+        let freq = |bi: usize| -> u32 { 8u32.pow(depths.get(bi).copied().unwrap_or(0).min(5)) };
         let mut weighted: HashMap<u32, u32> = HashMap::new();
         let mut projected: HashSet<u32> = HashSet::new();
         let mut addr_taken: HashSet<u32> = HashSet::new();
         let mut index_locals: HashSet<u32> = HashSet::new();
         let mut in_loop: HashSet<u32> = HashSet::new();
         for (bi, b) in self.func.blocks.iter().enumerate() {
-            let w = depths.get(bi).copied().unwrap_or(0) + 1;
+            let w = freq(bi);
             let mut local_counts: HashMap<u32, u32> = HashMap::new();
             for s in &b.stmts {
                 if let Stmt::Assign(p, rv) = s {
@@ -1554,80 +1480,89 @@ impl<'a> FnGen<'a> {
             }
             scan_term(&b.term, &mut local_counts, &mut projected, &mut addr_taken, &mut index_locals);
             for (l, c) in local_counts {
-                *counts.entry(l).or_insert(0) += c;
                 *weighted.entry(l).or_insert(0) += c * w;
                 if w > 1 {
                     in_loop.insert(l);
                 }
             }
         }
-        let ranked: Vec<(u32, u32, u32)> = counts
-            .into_iter()
-            .filter(|(l, c)| {
-                // A local used as an array index is worth a register even with
-                // a single textual use, because it is read on the address path
-                // of every access: `i & 255` feeding `table[i & 255]` in a loop
-                // has one use and would otherwise spill. Every other local
-                // keeps the two-use rule, so a one-shot arithmetic temporary is
-                // still folded into its consumer rather than given a register.
-                let index_use = index_locals.contains(l)
-                    && weighted.get(l).copied().unwrap_or(*c) >= 2;
-                (*c >= 2 || index_use)
-                    && !projected.contains(l)
-                    && !addr_taken.contains(l)
-            })
-            .filter(|(l, _)| !self.promo.contains_key(l))
-            .filter(|(l, _)| !self.size.get(*l as usize).copied().unwrap_or(8).eq(&8) || {
-                !self.ty.get(*l as usize).map(|t| t.is_aggregate()).unwrap_or(false)
-            })
-            .map(|(l, c)| (l, weighted.get(&l).copied().unwrap_or(c), c))
-            .collect();
-        // A `bool` temp is the result of a comparison consumed by the very next
-        // `switchInt`, so keeping it in memory costs a store and a load once per
-        // iteration; a `bool` in a register saves no more than that. An `i64`
-        // accumulator is read-modify-written every iteration, so a register saves
-        // a load *and* a store, and a loop constant saves a `movabs` on every
-        // iteration. Both are worth a register more than a `bool` temp, so the
-        // `bool` temps are promoted only after the `i64` locals and the constants
-        // have taken what they want.
-        let is_bool = |l: u32| matches!(self.ty.get(l as usize), Some(Ty::Bool));
-        let (mut bool_temps, mut ranked): (Vec<_>, Vec<_>) =
-            ranked.into_iter().partition(|(l, _, _)| is_bool(*l));
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        bool_temps.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
-        let pool = self.reg_pool();
-        for (l, _, _) in ranked {
-            if self.promo.len() >= pool.len() {
-                break;
-            }
-            self.promote_local(l, &mut used);
+        enum Cand {
+            Local(u32),
+            Const(i64),
         }
-        // Spend any registers the `i64` locals left idle on wide constants that
-        // recur in the body. A constant named in a loop pays a `movabs` on every
-        // iteration, the same order of cost as the load a promoted local saves;
-        // running before the `bool` temps lets it claim the last register when
-        // the loop has no room otherwise.
-        self.hoist_consts(&mut used);
-        for (l, _, _) in bool_temps.iter().copied() {
-            if self.promo.len() >= pool.len() {
-                break;
-            }
-            self.promote_local(l, &mut used);
-        }
-        // Phase B: every remaining scalar local that is not projected or
-        // address-taken, hottest first, shares a register with locals it never
-        // overlaps. The exclusive assignment above is unchanged, so this only
-        // adds registers where a value used to live in the frame.
-        let mut rest: Vec<(u32, u32)> = weighted
+        let mut cands: Vec<(u32, u8, i64, Cand)> = weighted
             .iter()
-            .filter(|(l, _)| !self.promo.contains_key(l))
             .filter(|(l, _)| !projected.contains(l) && !addr_taken.contains(l))
-            .map(|(l, w)| (*l, *w))
+            .filter(|(l, _)| !self.local_ty(**l).is_aggregate())
+            .map(|(l, w)| (*w, 0u8, *l as i64, Cand::Local(*l)))
             .collect();
-        rest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (v, w) in self.const_candidates(&freq) {
+            cands.push((w, 1u8, v, Cand::Const(v)));
+        }
+        // Hottest first; at equal weight a local before a constant (it can
+        // share its register), then by number so the order is deterministic.
+        cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
         let crossers = self.call_crossers();
-        for (l, _) in rest {
-            self.promote_shared(l, crossers.contains(&l), in_loop.contains(&l));
+        for (_, _, _, c) in cands {
+            match c {
+                Cand::Local(l) => {
+                    self.promote_shared(l, crossers.contains(&l), in_loop.contains(&l));
+                }
+                Cand::Const(v) => self.hoist_const(v),
+            }
+        }
+    }
+
+    /// Wide immediates worth a register, with their weighted use counts: each
+    /// constant outside the `i32` range an instruction can encode, and the
+    /// magic multiplier a signed division by a constant lowers to (generated,
+    /// not named in the source). Two uses break even -- one `movabs` per use
+    /// against one at entry and a register read per use -- and a single use in
+    /// a loop clears the bar.
+    fn const_candidates(&self, freq: &dyn Fn(usize) -> u32) -> Vec<(i64, u32)> {
+        let mut counts: HashMap<i64, u32> = HashMap::new();
+        for (bi, b) in self.func.blocks.iter().enumerate() {
+            let w = freq(bi);
+            for s in &b.stmts {
+                let mut count_op = |op: &Operand| {
+                    if let Operand::Const(Const::Int(v)) = op {
+                        if !(-2_147_483_648..=2_147_483_647).contains(v) {
+                            *counts.entry(*v).or_insert(0) += w;
+                        }
+                    }
+                };
+                scan_operands(s, &mut count_op);
+                if let Stmt::Assign(_, Rvalue::Binary(op, _, rhs)) = s {
+                    if matches!(op, BinOp::Div | BinOp::Rem) {
+                        if let Operand::Const(Const::Int(d)) = rhs {
+                            let mag = (*d).unsigned_abs();
+                            if *d != 0 && mag > 1 && !mag.is_power_of_two() {
+                                let (m, _, _) = sdiv_magic(mag);
+                                *counts.entry(m).or_insert(0) += w;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        counts.into_iter().filter(|(_, c)| *c >= 2).collect()
+    }
+
+    /// Keep the constant `v` in a register nothing else owns for the whole
+    /// function: a callee-saved one first (saved once at entry), else a
+    /// caller-saved one, saved and restored around each call
+    /// (`spill_caller_saved`). LLVM keeps `stats`'s `% 1000003` multiplier in
+    /// a caller-saved register for the whole loop.
+    fn hoist_const(&mut self, v: i64) {
+        let free = |r: &&'static str, me: &Self| {
+            me.reg_owners.get(*r).map(|o| o.is_empty()).unwrap_or(true)
+                && !me.const_regs.values().any(|c| *c == *r)
+                && !me.const_caller_regs.values().any(|c| *c == *r)
+        };
+        if let Some(reg) = PROMOTE_REGS.iter().find(|r| free(r, self)).copied() {
+            self.const_regs.insert(v, reg);
+        } else if let Some(reg) = CALLER_REGS.iter().find(|r| free(r, self)).copied() {
+            self.const_caller_regs.insert(v, reg);
         }
     }
 
@@ -1889,6 +1824,19 @@ impl<'a> FnGen<'a> {
         self.interf = interf;
     }
 
+    /// The ABI register argument `local` arrives in, if any. A function that
+    /// returns an aggregate receives the return pointer in `%rdi`, so its
+    /// arguments start at `%rsi` (see `gen_body`).
+    fn incoming_reg(&self, local: u32) -> Option<&'static str> {
+        let mut args: Vec<u32> = (0..self.func.locals.len() as u32)
+            .filter(|i| self.func.locals[*i as usize].is_arg)
+            .collect();
+        args.sort_unstable();
+        let ord = args.iter().position(|a| *a == local)?;
+        let shift = if self.local_ty(0).is_aggregate() { 1 } else { 0 };
+        ARG_REGS.get(ord + shift).copied()
+    }
+
     /// The locals live across a call or a destructor: a caller-saved register
     /// holding one is saved and restored around it.
     fn call_crossers(&self) -> HashSet<u32> {
@@ -1950,12 +1898,30 @@ impl<'a> FnGen<'a> {
         };
         let mut pool: Vec<&'static str> = Vec::new();
         if is_arg {
+            // An argument is copied out of its ABI register at entry, in
+            // parallel with the others, so it may not land in a register that
+            // still holds a later argument -- except its own: staying in the
+            // register it arrived in makes its entry move a no-op. That is the
+            // best home for an argument no call outlives (no save at entry, no
+            // load per use); one live across a call prefers a callee-saved
+            // register.
+            let own = self.incoming_reg(local).filter(|r| CALLER_REGS.contains(r));
+            if !crosses_call {
+                pool.extend(own);
+            }
             pool.extend(&callee_used);
             pool.extend(&callee_fresh);
+            if crosses_call {
+                pool.extend(own);
+            }
         } else if crosses_call {
+            // Not a caller-saved register: it would be stored before and
+            // reloaded after every call the local is live across, which costs
+            // as much as leaving it in its slot and measured slower in a
+            // recursive loop (`nqueens`'s running count: 47 ms in `%r8`, 44 ms
+            // in the frame).
             pool.extend(&callee_used);
             pool.extend(&callee_fresh);
-            pool.extend_from_slice(&CALLER_REGS);
         } else {
             pool.extend_from_slice(&CALLER_REGS);
             pool.extend(&callee_used);
@@ -1992,124 +1958,6 @@ impl<'a> FnGen<'a> {
         }
         let Some(t) = target else { return false };
         self.live_in.get(*t as usize).map(|s| s.contains(&local)).unwrap_or(true)
-    }
-
-    /// The registers this function may promote into. Caller-saved registers are
-    /// usable too; the generator spills them around any call. This holds even
-    /// for a function that reaches `alloc`: `alloc` keeps its state in globals,
-    /// not in a caller-saved register, so a promotion stays valid across it.
-    fn reg_pool(&self) -> Vec<&'static str> {
-        let mut pool: Vec<&'static str> = PROMOTE_REGS.to_vec();
-        pool.extend_from_slice(&CALLER_REGS);
-        pool
-    }
-
-    fn promote_local(&mut self, local: u32, used: &mut HashSet<&'static str>) {
-        if self.promo.contains_key(&local) {
-            return;
-        }
-        let ty = self.ty.get(local as usize).cloned().unwrap_or(Ty::I64);
-        if ty.is_aggregate() {
-            return;
-        }
-        // An argument is copied out of its ABI register at entry, in parallel,
-        // so a caller-saved register cannot be its destination: it may still
-        // hold a later argument that has not been moved yet. Restrict arguments
-        // to the callee-saved pool, which never overlaps the argument registers.
-        let is_arg = self.func.locals.get(local as usize).map(|l| l.is_arg).unwrap_or(false);
-        let pool = if is_arg { PROMOTE_REGS.to_vec() } else { self.reg_pool() };
-        let Some(reg) = pool.iter().find(|r| !used.contains(*r)).copied() else {
-            return;
-        };
-        used.insert(reg);
-        let caller_saved = CALLER_REGS.contains(&reg);
-        self.reg_owners.entry(reg).or_default().push(local);
-        self.promo.insert(local, Promo { reg, caller_saved });
-    }
-
-    /// Hoist the wide constants that recur in the body into spare registers. An
-    /// i64 immediate that does not fit a sign-extended i32 needs a `movabs` to
-    /// materialise, and a constant named inside a loop pays that on every
-    /// iteration. Keeping it in a register costs one `movabs` at entry.
-    ///
-    /// A callee-saved register is used first (a call cannot clobber it); once
-    /// those run out the constant goes into a caller-saved register the body
-    /// does not otherwise name, saved and restored around each call.
-    /// `plan_promotion` calls this after the loop operands and loop-invariant
-    /// locals have claimed their registers, so a constant never displaces the
-    /// values a register is worth most.
-    fn hoist_consts(&mut self, used: &mut HashSet<&'static str>) {
-        if !self.opts.promote {
-            return;
-        }
-        let depths = self.loop_depths();
-        // Wide immediates, weighted by the loop depth of the block that names
-        // them: a constant inside a loop is re-materialised every iteration.
-        let mut counts: HashMap<i64, u32> = HashMap::new();
-        for (bi, b) in self.func.blocks.iter().enumerate() {
-            let w = depths.get(bi).copied().unwrap_or(0) + 1;
-            for s in &b.stmts {
-                let mut count_op = |op: &Operand| {
-                    if let Operand::Const(Const::Int(v)) = op {
-                        if !(-2_147_483_648..=2_147_483_647).contains(v) {
-                            *counts.entry(*v).or_insert(0) += w;
-                        }
-                    }
-                };
-                scan_operands(s, &mut count_op);
-                // A signed division by a constant lowers to a wide magic
-                // multiplier that the back end materialises with `movabs`; it is
-                // generated, not named in the source, so count it here.
-                if let Stmt::Assign(_, Rvalue::Binary(op, _, rhs)) = s {
-                    if matches!(op, BinOp::Div | BinOp::Rem) {
-                        if let Operand::Const(Const::Int(d)) = rhs {
-                            let mag = (*d).unsigned_abs();
-                            if *d != 0 && mag > 1 && !mag.is_power_of_two() {
-                                let (m, _, _) = sdiv_magic(mag);
-                                *counts.entry(m).or_insert(0) += w;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Two uses break even: one `movabs` per use versus one at entry plus a
-        // register read per use. Weighting by loop depth makes a single use in a
-        // loop clear the bar, which is the case that matters.
-        let mut ranked: Vec<(i64, u32)> = counts
-            .into_iter()
-            .filter(|(_, c)| *c >= 2)
-            .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-        // Only registers promotion did not claim. Index-based so a constant the
-        // callee-saved pool cannot take is retried against the caller-saved one
-        // rather than dropped: a `break` in a `for ... by_ref()` would consume
-        // and discard that entry.
-        let mut idx = 0;
-        while idx < ranked.len() {
-            let Some(reg) = PROMOTE_REGS.iter().find(|r| !used.contains(*r)).copied() else {
-                break;
-            };
-            used.insert(reg);
-            self.const_regs.insert(ranked[idx].0, reg);
-            idx += 1;
-        }
-        // The callee-saved pool is exhausted, so the next hottest constants go
-        // into the caller-saved registers the body does not otherwise name. A
-        // call clobbers them, so each is saved and restored around every call
-        // (see `spill_caller_saved`). This is what closes `stats`: LLVM keeps
-        // the `% 1000003` magic multiplier in a caller-saved register for the
-        // whole loop, and rmc's five callee-saved registers are all held by hot
-        // locals there.
-        while idx < ranked.len() {
-            let Some(reg) = CALLER_REGS.iter().find(|r| !used.contains(*r)).copied() else {
-                break;
-            };
-            used.insert(reg);
-            self.const_caller_regs.insert(ranked[idx].0, reg);
-            idx += 1;
-        }
     }
 
     // --- function ----------------------------------------------------------
@@ -2350,7 +2198,10 @@ impl<'a> FnGen<'a> {
                 return Err(format!("mir_codegen: {} takes more than 6 arguments", self.func.name));
             }
             let dst = self.local_operand(li);
-            let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord + arg_shift], dst);
+            // An argument promoted to the register it arrived in stays put.
+            if dst != ARG_REGS[ord + arg_shift] {
+                let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord + arg_shift], dst);
+            }
         }
         // Materialise caller-saved hoisted constants after the argument moves:
         // until the last move the argument registers still hold incoming
@@ -7619,6 +7470,30 @@ fn f(_1: &[i64; 8], _2: i64) -> i64 {
         });
         assert!(one, "no scaled-index load:\n{f}");
         assert!(!f.contains("lea (%rax,%rcx,8)") && !f.contains("%rcx,8)"), "{f}");
+    }
+
+    /// An argument no call outlives stays in the register it arrived in: no
+    /// move into a callee-saved register (and its push/pop), no frame slot.
+    #[test]
+    fn an_argument_stays_in_its_incoming_register() {
+        let f = asm_of(
+            "\
+fn f(_1: &[i64; 8], _2: i64) -> i64 {
+    let mut _0: i64;
+    let mut _3: i64;
+
+    bb0: {
+        _3 = Add(copy _2, const 1_i64);
+        _0 = Mul(copy _3, copy _2);
+        return;
+    }
+}
+",
+            "f",
+        );
+        assert!(!f.contains("push %r") && !f.contains("push %rbx"), "{f}");
+        assert!(!f.contains("mov %rsi, -") && !f.contains("mov %rsi, %r1"), "{f}");
+        assert!(f.contains("%rsi"), "{f}");
     }
 
     /// A bounds check that falls through on success branches to one shared,
