@@ -60,6 +60,18 @@ impl Default for Options {
 /// A promoted local: which register holds it, and whether that register has to
 /// be saved/restored across a call.
 #[derive(Clone, Copy)]
+/// Where a place's bytes are, when one x86 addressing mode reaches them: a
+/// base (a frame local, or a pointer local), a constant displacement, and at
+/// most one index local scaled by 1, 2, 4 or 8.
+struct MemPlan {
+    /// `None`: the frame (`%rbp` plus the local's offset); `Some(l)`: the
+    /// pointer held in local `l`.
+    ptr: Option<u32>,
+    frame_local: u32,
+    disp: i64,
+    index: Option<(u32, i64)>,
+}
+
 struct Promo {
     reg: &'static str,
     caller_saved: bool,
@@ -134,6 +146,8 @@ struct FnGen<'a> {
     interf: HashMap<u32, HashSet<u32>>,
     /// Register -> the promoted locals assigned to it.
     reg_owners: HashMap<&'static str, Vec<u32>>,
+    /// Whether the body jumped to the shared panic exit (`trap_label`).
+    trap_used: bool,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
     /// has revealed which slots the body actually touches.
     slot_map: Option<Vec<i64>>,
@@ -1265,6 +1279,7 @@ impl<'a> FnGen<'a> {
             no_share: HashSet::new(),
             interf: HashMap::new(),
             reg_owners: HashMap::new(),
+            trap_used: false,
             slot_map: None,
             next_slot: 0,
             pinned: Vec::new(),
@@ -2314,6 +2329,7 @@ impl<'a> FnGen<'a> {
     /// Argument setup plus every basic block. Run twice (dry, then real).
     fn gen_body(&mut self) -> Result<(), String> {
         self.pinned.clear();
+        self.trap_used = false;
         // A hidden return pointer arrives in `%rdi` and is stashed in its frame
         // slot before the argument moves, which would overwrite `%rdi`. The
         // arguments of an aggregate-returning function therefore start at
@@ -2359,7 +2375,18 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
         }
+        // The failure path of every assertion that falls through on success:
+        // out of line, so a bounds check costs a not-taken branch.
+        if self.trap_used {
+            let t = self.trap_label();
+            let _ = writeln!(self.out, "{t}:\n  mov $101, %rdi\n  mov $60, %rax\n  syscall");
+        }
         Ok(())
+    }
+
+    /// The function's shared panic exit (exit status 101, as rustc's panic).
+    fn trap_label(&self) -> String {
+        format!(".Lrmc_{}_trap", self.label_tag())
     }
 
     /// A basic-block label, qualified by the function name so that labels from
@@ -2727,12 +2754,13 @@ impl<'a> FnGen<'a> {
                 }
                 // A `assert(cmp, ..)` folds the comparison into the flags, so
                 // the `bool` local is never materialised.
-                let jcc = match self.emit_fused_compare(bb, cond)? {
+                // `ok` jumps when the assertion holds, `fail` when it does not.
+                let (ok, fail) = match self.emit_fused_compare(bb, cond)? {
                     Some((op, u)) => {
                         // `assert(!cmp, ..)` succeeds when the comparison is
                         // false, so jump on the complement of the comparison.
                         let op = if *negate { negate_cc(op) } else { op };
-                        jcc(op, u)
+                        (jcc(op, u), jcc(negate_cc(op), u))
                     }
                     None => {
                         // Otherwise evaluate the condition into `%rax` and test.
@@ -2743,13 +2771,21 @@ impl<'a> FnGen<'a> {
                         self.emit("  test %rax, %rax");
                         // `!x` succeeds when `x == 0`; a plain condition
                         // succeeds when it is non-zero.
-                        if *negate { "je" } else { "jne" }
+                        if *negate { ("je", "jne") } else { ("jne", "je") }
                     }
                 };
-                self.emit(&format!("  {jcc} .Lbb{}", self.bb_label(*target)));
-                self.emit("  mov $101, %rdi");
-                self.emit("  mov $60, %rax");
-                self.emit("  syscall");
+                if *target == bb + 1 && (*target as usize) < self.func.blocks.len() {
+                    // The success block is next: fall into it, and branch out
+                    // of line only on failure.
+                    self.trap_used = true;
+                    let t = self.trap_label();
+                    self.emit(&format!("  {fail} {t}"));
+                } else {
+                    self.emit(&format!("  {ok} .Lbb{}", self.bb_label(*target)));
+                    self.emit("  mov $101, %rdi");
+                    self.emit("  mov $60, %rax");
+                    self.emit("  syscall");
+                }
             }
             Terminator::SwitchInt { discr, targets, otherwise } => {
                 self.gen_switch(bb, discr, targets, *otherwise)?;
@@ -2933,6 +2969,13 @@ impl<'a> FnGen<'a> {
                     // `place_addr` computes into `%rax`, so the caller's `%rax`
                     // (which for a binary op is the left operand) is saved in a
                     // scratch slot and restored afterwards.
+                    if let Some(plan) = self.mem_plan(p) {
+                        if !self.plan_loads_ptr(&plan) && !self.place_ty(p).is_aggregate() {
+                            let mem = self.emit_mem_plan(&plan, "%rcx");
+                            self.load_mem_to(p, &mem, "%rcx");
+                            return Ok(("%rcx".to_string(), false));
+                        }
+                    }
                     let tmp = self.alloc_slot();
                     self.emit(&format!("  mov %rax, {}", self.off(tmp)));
                     self.load_place_to(p, "%rcx")?;
@@ -3151,6 +3194,138 @@ impl<'a> FnGen<'a> {
     }
 
     /// Leave the address of `place` in `%rax`.
+    /// Plan a single addressing mode for `p`, or `None` when the place needs
+    /// `place_addr`'s general walk (a deref past the first projection, two
+    /// dynamic indices, a stride other than 1/2/4/8, or a bare scalar local,
+    /// whose promoted register has no address). Emits nothing.
+    ///
+    /// Only a place reached through a pointer (`(*p)[i]`, or an aggregate
+    /// argument, which is passed by address) is planned. A frame local keeps
+    /// `place_addr`'s `lea N(%rbp)`: the slot peepholes (`drop_unread_stores`,
+    /// `forward_stores`) recognise a slot by its `N(%rbp)` text and treat a
+    /// `lea` of it as the address escaping, so an indexed `N(%rbp,%i,8)` read
+    /// would be invisible to them and the stores that initialise the array
+    /// would be dropped as unread.
+    fn mem_plan(&self, p: &Place) -> Option<MemPlan> {
+        if p.proj.is_empty() {
+            return None;
+        }
+        let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
+        let agg_arg = !starts_deref
+            && self.local_ty(p.local).is_aggregate()
+            && self.func.locals.get(p.local as usize).map(|l| l.is_arg).unwrap_or(false);
+        if !starts_deref && !agg_arg {
+            return None;
+        }
+        let mut ty = self.local_ty(p.local);
+        if starts_deref {
+            ty = match &ty {
+                Ty::Ref(t) | Ty::Ptr(t) => (**t).clone(),
+                _ => Ty::I64,
+            };
+        }
+        let rest = if starts_deref { &p.proj[1..] } else { &p.proj[..] };
+        let mut disp = 0i64;
+        let mut index: Option<(u32, i64)> = None;
+        let mut variant_ctx: Option<(String, String)> = None;
+        for proj in rest {
+            match proj {
+                Proj::Field(k) => {
+                    if let Some((en, v)) = &variant_ctx {
+                        disp += *k as i64 * 8;
+                        ty = self.enum_field_ty(en, v, *k as u64);
+                        variant_ctx = None;
+                        continue;
+                    }
+                    disp += self.field_offset(&ty, *k as u64);
+                    ty = self.field_ty(&ty, *k as u64);
+                }
+                Proj::Variant(v) => {
+                    if let Ty::Struct(en) = &ty {
+                        disp += self.enum_field_offset(en, v, 0);
+                        variant_ctx = Some((en.clone(), v.clone()));
+                    }
+                }
+                Proj::IndexConst(i) => {
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(1);
+                    disp += *i as i64 * stride + slice_header(&ty);
+                    ty = elem_ty(&ty);
+                }
+                Proj::IndexLocal(l) => {
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(1);
+                    if index.is_some() || ![1, 2, 4, 8].contains(&stride) {
+                        return None;
+                    }
+                    index = Some((*l, stride));
+                    disp += slice_header(&ty);
+                    ty = elem_ty(&ty);
+                }
+                Proj::Deref => return None,
+                Proj::RawRef => {}
+            }
+        }
+        if disp.unsigned_abs() > i32::MAX as u64 / 2 {
+            return None;
+        }
+        let ptr = if starts_deref || agg_arg { Some(p.local) } else { None };
+        Some(MemPlan { ptr, frame_local: p.local, disp, index })
+    }
+
+    /// Whether emitting `plan` must load its pointer into a scratch register
+    /// (the pointer local lives in a frame slot, not a register).
+    fn plan_loads_ptr(&self, plan: &MemPlan) -> bool {
+        match plan.ptr {
+            Some(l) => !self.local_operand(l).starts_with('%'),
+            None => false,
+        }
+    }
+
+    /// Emit what `plan` needs (the pointer into `ptr_reg` when it is in memory,
+    /// the index into `%rcx` when it is in memory) and return the operand.
+    fn emit_mem_plan(&mut self, plan: &MemPlan, ptr_reg: &str) -> String {
+        let (base, disp) = match plan.ptr {
+            Some(l) => {
+                let src = self.local_operand(l);
+                if src.starts_with('%') {
+                    (src, plan.disp)
+                } else {
+                    self.emit(&format!("  mov {src}, {ptr_reg}"));
+                    (ptr_reg.to_string(), plan.disp)
+                }
+            }
+            None => {
+                let o = self.off(self.local_base(plan.frame_local));
+                let n: i64 = o.trim_end_matches("(%rbp)").parse().unwrap_or(0);
+                ("%rbp".to_string(), n + plan.disp)
+            }
+        };
+        let d = if disp == 0 && base != "%rbp" { String::new() } else { disp.to_string() };
+        match plan.index {
+            None => format!("{d}({base})"),
+            Some((l, stride)) => {
+                let src = self.local_operand(l);
+                let idx = if src.starts_with('%') {
+                    src
+                } else {
+                    self.emit(&format!("  mov {src}, %rcx"));
+                    "%rcx".to_string()
+                };
+                format!("{d}({base},{idx},{stride})")
+            }
+        }
+    }
+
+    /// A memory operand for `p`: one addressing mode when `mem_plan` finds
+    /// one, else `(%rax)` after `place_addr`. Clobbers at most `%rax`/`%rcx`,
+    /// as `place_addr` does.
+    fn place_mem(&mut self, p: &Place) -> Result<String, String> {
+        if let Some(plan) = self.mem_plan(p) {
+            return Ok(self.emit_mem_plan(&plan, "%rax"));
+        }
+        self.place_addr(p)?;
+        Ok("(%rax)".to_string())
+    }
+
     fn place_addr(&mut self, p: &Place) -> Result<(), String> {
         let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
         // An aggregate argument is passed by address: its frame slot holds a
@@ -3359,33 +3534,28 @@ impl<'a> FnGen<'a> {
 
     /// Load the scalar value at `place` into `reg` (which may be `%rax`).
     fn load_place_to(&mut self, p: &Place, reg: &str) -> Result<(), String> {
-        self.place_addr(p)?;
+        let mem = self.place_mem(p)?;
+        self.load_mem_to(p, &mem, reg);
+        Ok(())
+    }
+
+    /// Load the scalar at `mem` (the operand for place `p`) into `reg`.
+    fn load_mem_to(&mut self, p: &Place, mem: &str, reg: &str) {
         // A `u8`/`i8` is one byte, so a whole-word load would pull in the seven
         // bytes after it. The byte is zero-extended for `u8` and sign-extended
         // for `i8`, so the value in the slot matches the type's semantics.
         match self.place_ty(p).int_width_sign() {
             Some((1, true)) => {
-                self.emit("  movsbq (%rax), %rax");
-                if reg != "%rax" {
-                    self.emit(&format!("  mov %rax, {reg}"));
-                }
-                return Ok(());
+                self.emit(&format!("  movsbq {mem}, {reg}"));
+                return;
             }
             Some((1, false)) => {
-                self.emit("  movzbl (%rax), %eax");
-                if reg != "%rax" {
-                    self.emit(&format!("  mov %rax, {reg}"));
-                }
-                return Ok(());
+                self.emit(&format!("  movzbl {mem}, {}", dword_reg(reg)));
+                return;
             }
             _ => {}
         }
-        if reg != "%rax" {
-            self.emit(&format!("  mov (%rax), {reg}"));
-        } else {
-            self.emit("  mov (%rax), %rax");
-        }
-        Ok(())
+        self.emit(&format!("  mov {mem}, {reg}"));
     }
 
     /// Canonicalise `%rax` to the value of an integer type: truncate to its
@@ -4016,8 +4186,8 @@ impl<'a> FnGen<'a> {
             } else {
                 ("mov", byte_reg(src))
             };
-            self.place_addr(dest)?;
-            self.emit(&format!("  {mnem} {src}, (%rax)"));
+            let mem = self.place_mem(dest)?;
+            self.emit(&format!("  {mnem} {src}, {mem}"));
             return Ok(());
         }
         // A memory source cannot be the source of a memory destination, and
@@ -4032,11 +4202,11 @@ impl<'a> FnGen<'a> {
         } else {
             src
         };
-        self.place_addr(dest)?;
+        let mem = self.place_mem(dest)?;
         // An unsuffixed `mov $imm, (mem)` is a 32-bit store and zero-extends a
         // negative immediate; `movq` is the sign-extending 64-bit form.
         let mnem = if src.starts_with('$') { "movq" } else { "mov" };
-        self.emit(&format!("  {mnem} {src}, (%rax)"));
+        self.emit(&format!("  {mnem} {src}, {mem}"));
         Ok(())
     }
 
@@ -4553,6 +4723,27 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  {m} {bv}, %rax"));
             }
             BinOp::Shl | BinOp::Shr => {
+                let m = match op {
+                    BinOp::Shl => "sal",
+                    // An unsigned shift fills with zeros, a signed one with the
+                    // sign bit. MIR's `Shr` covers both; the operand's type
+                    // decides, or `0x8000000000000000u64 >> 60` fills with ones
+                    // and reads as a huge negative instead of 8.
+                    _ => {
+                        if self.operand_ty(a).is_unsigned() {
+                            "shr"
+                        } else {
+                            "sar"
+                        }
+                    }
+                };
+                // A constant count is an immediate. The hardware masks a
+                // 64-bit shift's count to six bits whether it comes from `%cl`
+                // or an immediate, so masking here keeps the two forms equal.
+                if let Operand::Const(Const::Int(k)) = b {
+                    self.emit(&format!("  {m} ${}, %rax", k & 63));
+                    return Ok(());
+                }
                 // The shift count must be in `%cl`. Evaluating it may make a
                 // call, which clobbers every scratch register, so the value is
                 // parked in a frame slot rather than `%rdx` while the count is
@@ -4564,21 +4755,6 @@ impl<'a> FnGen<'a> {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
                 self.emit(&format!("  mov {}, %rax", self.off(tmp)));
-                let m = match op {
-                    BinOp::Shl => "sal",
-                    // An unsigned shift fills with zeros, a signed one with the
-                    // sign bit. MIR's `Shr` covers both; the operand's type
-                    // decides, or `0x8000000000000000u64 >> 60` fills with ones
-                    // and reads as a huge negative instead of 8.
-                    BinOp::Shr => {
-                        if self.operand_ty(a).is_unsigned() {
-                            "shr"
-                        } else {
-                            "sar"
-                        }
-                    }
-                    _ => unreachable!(),
-                };
                 self.emit(&format!("  {m} %cl, %rax"));
             }
             BinOp::Div | BinOp::Rem => {
@@ -6915,6 +7091,21 @@ fn elem_ty(ty: &Ty) -> Ty {
     }
 }
 
+/// The 32-bit name of a 64-bit register (a `movzbl` destination).
+fn dword_reg(reg: &str) -> String {
+    match reg {
+        "%rax" => "%eax".into(),
+        "%rbx" => "%ebx".into(),
+        "%rcx" => "%ecx".into(),
+        "%rdx" => "%edx".into(),
+        "%rsi" => "%esi".into(),
+        "%rdi" => "%edi".into(),
+        "%rbp" => "%ebp".into(),
+        "%rsp" => "%esp".into(),
+        r => format!("{r}d"),
+    }
+}
+
 /// The 8-bit register holding the low byte of a 64-bit register name.
 fn byte_reg(reg: &str) -> &str {
     match reg {
@@ -7333,6 +7524,110 @@ mod tests {
     /// the liveness test was too coarse the fold bailed, and the backend paid
     /// `setl`/`movzbl`/store plus a second `cmp` on every iteration, which is
     /// what put `fib` and `callrec` behind LLVM. This checks the `setl` is gone.
+    /// Compile MIR text and return the named function's assembly. Only what
+    /// `main` reaches is emitted, so `f` is called from a `main` that passes
+    /// it a frame array and a runtime index.
+    fn asm_of(src: &str, name: &str) -> String {
+        let src = format!(
+            "{src}
+fn main() -> i64 {{
+    let mut _0: i64;
+    let mut _1: [i64; 8];
+    let mut _2: &[i64; 8];
+    let mut _3: i64;
+
+    bb0: {{
+        _1 = [const 1_i64; 8];
+        _2 = &_1;
+        _3 = arg_i64(const 1_i64) -> [return: bb1, unwind unreachable];
+    }}
+
+    bb1: {{
+        _0 = f(copy _2, copy _3) -> [return: bb2, unwind unreachable];
+    }}
+
+    bb2: {{
+        return;
+    }}
+}}
+"
+        );
+        let mut prog = crate::mir::parse(&src).expect("parse");
+        crate::mir::layout_blocks(&mut prog);
+        let asm = compile(&prog, &Options::default()).expect("compile");
+        let f = func_asm(&asm, name);
+        assert!(!f.is_empty(), "{name} not emitted:\n{asm}");
+        f.to_string()
+    }
+
+    /// `f(p: &[i64; 8], i: usize) -> i64 { p[i] }` with its bounds check.
+    const INDEX_THROUGH_REF: &str = "\
+fn f(_1: &[i64; 8], _2: usize) -> i64 {
+    let mut _0: i64;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = Lt(copy _2, const 8_usize);
+        assert(move _3, \"index out of bounds\", const 8_usize, copy _2) -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _0 = copy (*_1)[_2];
+        return;
+    }
+}
+";
+
+    /// A shift by a constant is an immediate, not a count loaded into `%cl`
+    /// (which also cost a frame slot to park the shifted value).
+    #[test]
+    fn a_constant_shift_count_is_an_immediate() {
+        let f = asm_of(
+            "\
+fn f(_1: &[i64; 8], _2: i64) -> i64 {
+    let mut _0: i64;
+
+    bb0: {
+        _0 = Shl(copy _2, const 13_i32);
+        return;
+    }
+}
+",
+            "f",
+        );
+        assert!(f.contains("sal $13,"), "{f}");
+        assert!(!f.contains("%cl"), "{f}");
+    }
+
+    /// An element read through a reference is one instruction with a scaled
+    /// index, not `lea`/`mov`/`lea`/`mov` through `%rax` and `%rcx`.
+    #[test]
+    fn an_element_through_a_reference_is_one_addressing_mode() {
+        let f = asm_of(INDEX_THROUGH_REF, "f");
+        // (The pointer argument itself may sit in a frame slot: outside a
+        // loop a callee-saved register costs as much as the slot.)
+        let one = f.lines().any(|l| {
+            let t = l.trim();
+            t.starts_with("mov (%") && t.contains(",8), ")
+        });
+        assert!(one, "no scaled-index load:\n{f}");
+        assert!(!f.contains("lea (%rax,%rcx,8)") && !f.contains("%rcx,8)"), "{f}");
+    }
+
+    /// A bounds check that falls through on success branches to one shared,
+    /// out-of-line panic exit on failure, and compares unsigned.
+    #[test]
+    fn a_bounds_check_branches_out_of_line_on_failure() {
+        let f = asm_of(INDEX_THROUGH_REF, "f");
+        assert!(f.contains("jae .Lrmc_f_trap"), "{f}");
+        let check = f.find("jae .Lrmc_f_trap").unwrap();
+        let trap = f.find(".Lrmc_f_trap:").expect("trap block emitted");
+        assert!(trap > check, "{f}");
+        // The success path reaches the load without passing an exit syscall.
+        let load = f[check..].find("mov (%").map(|o| o + check).expect("load");
+        assert!(!f[check..load].contains("syscall"), "{f}");
+    }
+
     #[test]
     fn reused_bool_local_still_folds() {
         let src = "\
