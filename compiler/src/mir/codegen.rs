@@ -5785,6 +5785,38 @@ fn addsub_imm_at(line: Option<&str>) -> Option<(i64, &str)> {
 }
 
 /// Whether an instruction reads the flags a preceding `add` would set.
+/// Whether the flags may be read at or after `lines[from]` before something
+/// sets them again. A label or a jump ends the scan as "may be read" (code
+/// reached there is not visible here); a `call`/`ret` as "not read" (the ABI
+/// does not preserve flags).
+fn flags_live_from(lines: &[&str], from: usize) -> bool {
+    for line in &lines[from.min(lines.len())..] {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.ends_with(':') || t.starts_with('.') {
+            return true;
+        }
+        if flags_used_by(Some(t)) {
+            return true;
+        }
+        let op = t.split_whitespace().next().unwrap_or("");
+        if matches!(op, "call" | "ret" | "syscall") {
+            return false;
+        }
+        if matches!(
+            op,
+            "add" | "addq" | "sub" | "subq" | "and" | "andq" | "or" | "orq" | "xor" | "xorq"
+                | "cmp" | "cmpq" | "test" | "testq" | "neg" | "imul" | "sal" | "shl" | "sar"
+                | "shr"
+        ) {
+            return false;
+        }
+    }
+    false
+}
+
 fn flags_used_by(line: Option<&str>) -> bool {
     let Some(line) = line else { return false };
     let t = line.trim();
@@ -5979,6 +6011,25 @@ fn fuse_lea(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i + 1 < lines.len() {
+        // `mov %a, %d; add|sub $k, %d` -> `lea ±k(%a), %d` when `%d` is a
+        // promoted register: a temporary that lives in a register of its own
+        // (`n - 1` passed as an argument) is computed in place, so the
+        // scratch-register pattern below never sees it. `%d` ends up with the
+        // same value either way; only the flags differ, so they must be dead.
+        // (`mov %a, %d; sub $k, %d` is `a - k`, which a displacement does
+        // express; it is `mov $k, %d; sub %a, %d`, `k - a`, that never folds.)
+        if let Some((a, d)) = mov_reg_reg(lines[i]) {
+            if a != d && !SCRATCH.contains(&d) {
+                if let Some((op, k, dst)) = addsub_imm(lines[i + 1]) {
+                    if dst == d && k.unsigned_abs() < (1 << 31) && !flags_live_from(&lines, i + 2) {
+                        let disp = if op == "add" { k } else { -k };
+                        out.push_str(&format!("  lea {disp}({a}), {d}\n"));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
         // `mov %a, %t; mov %t, %d` -> `mov %a, %d`, when `%t` is a scratch
         // register that is dead afterwards. The generator parks a result in a
         // scratch register and then copies it into the local that owns it.
@@ -7494,6 +7545,20 @@ fn f(_1: &[i64; 8], _2: i64) -> i64 {
         assert!(!f.contains("push %r") && !f.contains("push %rbx"), "{f}");
         assert!(!f.contains("mov %rsi, -") && !f.contains("mov %rsi, %r1"), "{f}");
         assert!(f.contains("%rsi"), "{f}");
+    }
+
+    /// `mov %a, %d; sub $k, %d` into a promoted register is `lea -k(%a), %d`
+    /// when nothing reads the flags; a flag reader keeps the `sub`.
+    #[test]
+    fn a_register_minus_a_constant_into_a_promoted_register_is_a_lea() {
+        let body = "  mov %rbx, %rdi\n  sub $1, %rdi\n  call f\n";
+        assert_eq!(fuse_lea(body), "  lea -1(%rbx), %rdi\n  call f\n");
+        let body = "  mov %rbx, %rdi\n  add $3, %rdi\n  mov %rdi, %rsi\n  cmp $0, %rsi\n";
+        assert_eq!(fuse_lea(body), "  lea 3(%rbx), %rdi\n  mov %rdi, %rsi\n  cmp $0, %rsi\n");
+        let body = "  mov %rbx, %rdi\n  sub $1, %rdi\n  jne .L1\n";
+        assert_eq!(fuse_lea(body), body, "the jne reads the sub's flags");
+        let body = "  mov %rbx, %rdi\n  sub $1, %rdi\n.L2:\n  jne .L1\n";
+        assert_eq!(fuse_lea(body), body, "flags may be read past a label");
     }
 
     /// A bounds check that falls through on success branches to one shared,
