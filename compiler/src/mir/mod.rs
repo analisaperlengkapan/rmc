@@ -6696,6 +6696,10 @@ struct AssertFacts {
     /// A bool `b = (x < LEN)`: `b` is the bounds check for an index derived
     /// from `x` against length `LEN`.
     lt: HashMap<u32, (u32, u64)>,
+    /// Locals proven non-negative (as signed integers). With `x < LEN` on a
+    /// branch this bounds a signed loop counter: `x = 0` is non-negative, and
+    /// `x = x + 1` stays so when `x` is bounded and cannot overflow.
+    nonneg: HashSet<u32>,
 }
 
 impl Function {
@@ -6704,12 +6708,20 @@ impl Function {
         // A local whose address is taken can change through the pointer
         // without a statement naming it, so no fact is ever recorded about it.
         let escaped = self.escaped_locals();
+        let unsigned: HashSet<u32> = (0..self.locals.len() as u32)
+            .filter(|l| {
+                let t = &self.locals[*l as usize].ty;
+                t.is_unsigned()
+            })
+            .collect();
         let mut facts_in: Vec<Option<AssertFacts>> = vec![None; n];
         facts_in[0] = Some(AssertFacts::default());
+        let mut sweeps = 0;
         loop {
             let mut changed = false;
             for b in 0..n {
-                let Some(mut facts) = facts_at_term(&self.blocks[b], &facts_in[b], &escaped)
+                let Some(mut facts) =
+                    facts_at_term(&self.blocks[b], &facts_in[b], &escaped, &self.locals)
                 else {
                     continue;
                 };
@@ -6726,15 +6738,45 @@ impl Function {
                     match edge {
                         EdgeFact::NonZero(l) => {
                             contributed.nonzero.insert(contributed.resolve(l));
+                            // The edge where `b = (x < LEN)` held: an unsigned
+                            // `x` is in `[0, LEN - 1]` here. This is the loop
+                            // test `while x < 128`, which bounds every index
+                            // the body derives from `x`.
+                            if let Some((x, len)) = contributed.lt.get(&l).copied() {
+                                let nn = unsigned.contains(&x)
+                                    || contributed.nonneg.contains(&x)
+                                    || contributed.nonneg.contains(&contributed.resolve(x));
+                                // rustc tests a copy (`_34 = copy _32; Lt(move
+                                // _34, ..)`), so the bound goes to the copied
+                                // local as well.
+                                let root = contributed.resolve(x);
+                                for v in [x, root] {
+                                    if len > 0 && nn && !escaped.contains(&v) {
+                                        let m = len - 1;
+                                        let cur = contributed.masked.get(&v).copied();
+                                        contributed.masked.insert(v, cur.map_or(m, |c| c.min(m)));
+                                        contributed.nonneg.insert(v);
+                                    }
+                                }
+                            }
                         }
                         EdgeFact::Zero(l) => {
                             contributed.zero.insert(contributed.resolve(l));
                         }
                         EdgeFact::None => {}
                     }
+                    // At an ordinary join a bound holds as the larger of the
+                    // two sides. Across iterations that lets a bound grow from
+                    // the first, optimistic pass (`x = 0` before the loop has
+                    // run) to its real value (`x < 128` on the loop edge). At a
+                    // loop header (the target of a back edge, here an edge to
+                    // an earlier block) a bound that differs is dropped
+                    // instead, so a counter with no test bounding it cannot grow
+                    // one step per sweep.
                     let merged = match &facts_in[s] {
                         None => Some(contributed),
-                        Some(prev) => Some(prev.intersect(&contributed)),
+                        Some(prev) if s <= b => Some(prev.intersect(&contributed)),
+                        Some(prev) => Some(prev.join(&contributed)),
                     };
                     if merged != facts_in[s] {
                         changed = true;
@@ -6745,6 +6787,12 @@ impl Function {
             if !changed {
                 break;
             }
+            sweeps += 1;
+            if sweeps > 256 {
+                // Block order that hides a loop header from the rule above
+                // could keep a bound growing; keep every assertion.
+                return;
+            }
         }
         // Drop an `assert` the state at its own terminator proves. Two forms
         // matter: `assert(x)` with `x` known non-zero (rustc's direct form), and
@@ -6753,7 +6801,9 @@ impl Function {
         // The `bool` is defined by a statement in the same block, so the block's
         // statements are replayed onto the entry state first.
         for b in 0..n {
-            let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b], &escaped) else {
+            let Some(facts) =
+                facts_at_term(&self.blocks[b], &facts_in[b], &escaped, &self.locals)
+            else {
                 continue;
             };
             let Terminator::Assert { cond, negate, target } = &self.blocks[b].term else {
@@ -6864,6 +6914,33 @@ impl AssertFacts {
         cur
     }
 
+    /// An upper bound for an operand known to be in `[0, bound]`: a
+    /// non-negative integer constant, or a local with a `masked` fact.
+    fn bound_of(&self, o: &Operand) -> Option<u64> {
+        match o {
+            Operand::Const(Const::Int(v)) if *v >= 0 => Some(*v as u64),
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => self
+                .masked
+                .get(&p.local)
+                .or_else(|| self.masked.get(&self.resolve(p.local)))
+                .copied(),
+            _ => None,
+        }
+    }
+
+    /// Whether an operand is known non-negative.
+    fn nonneg_of(&self, o: &Operand) -> bool {
+        match o {
+            Operand::Const(Const::Int(v)) => *v >= 0,
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                self.nonneg.contains(&p.local)
+                    || self.nonneg.contains(&self.resolve(p.local))
+                    || self.bound_of(o).is_some()
+            }
+            _ => false,
+        }
+    }
+
     /// Invalidate every fact that depends on `l`.
     fn kill(&mut self, l: u32) {
         self.nonzero.remove(&l);
@@ -6876,6 +6953,19 @@ impl AssertFacts {
         self.lt.remove(&l);
         // `b = (x < LEN)` says nothing once `x` changes.
         self.lt.retain(|_, (x, _)| *x != l);
+        self.nonneg.remove(&l);
+    }
+
+    /// `intersect`, except that a bound known on both sides survives as the
+    /// larger of the two.
+    fn join(&self, other: &AssertFacts) -> AssertFacts {
+        let mut out = self.intersect(other);
+        for (d, m) in &self.masked {
+            if let Some(o) = other.masked.get(d) {
+                out.masked.insert(*d, (*m).max(*o));
+            }
+        }
+        out
     }
 
     fn intersect(&self, other: &AssertFacts) -> AssertFacts {
@@ -6910,6 +7000,7 @@ impl AssertFacts {
                 .filter(|(b, v)| other.lt.get(b) == Some(v))
                 .map(|(b, v)| (*b, *v))
                 .collect(),
+            nonneg: self.nonneg.intersection(&other.nonneg).copied().collect(),
         }
     }
 }
@@ -6920,6 +7011,7 @@ fn facts_at_term(
     block: &BasicBlock,
     entry: &Option<AssertFacts>,
     escaped: &HashSet<u32>,
+    locals: &[LocalDecl],
 ) -> Option<AssertFacts> {
     let mut facts = entry.clone()?;
     // Locals written later in the block: an alias to one of them is not valid
@@ -6932,14 +7024,34 @@ fn facts_at_term(
     }
     let mut killed: HashSet<u32> = HashSet::new();
     for s in &block.stmts {
+        // The new value's range comes from the facts *before* the write, so a
+        // self-update (`x = x + 1`) still sees what was known about `x`.
+        let new_range = match s {
+            Stmt::Assign(d, rv) if d.proj.is_empty() && !escaped.contains(&d.local) => {
+                rv_range(&facts, rv)
+            }
+            _ => None,
+        };
         if let Some(l) = written_local(s) {
             facts.kill(l);
             killed.insert(l);
             later_writes.remove(&l);
         }
+        if let (Some((bound, nonneg)), Stmt::Assign(d, _)) = (new_range, s) {
+            if let Some(m) = bound {
+                facts.masked.insert(d.local, m);
+            }
+            if nonneg {
+                facts.nonneg.insert(d.local);
+            }
+        }
         if let Stmt::Assign(d, rv) = s {
-            // Facts are recorded only about locals that cannot change behind
-            // the analysis's back, and only from operands that cannot either.
+            // A write through a pointer may change any escaped local.
+            if d.proj.first().is_some_and(|p| matches!(p, Proj::Deref)) {
+                for &l in escaped {
+                    facts.kill(l);
+                }
+            }
             let reads: HashSet<u32> = rv_operands(rv).iter().map(|p| p.local).collect();
             if d.proj.is_empty() && !escaped.contains(&d.local) && reads.is_disjoint(escaped) {
                 match rv {
@@ -6957,33 +7069,26 @@ fn facts_at_term(
                     {
                         facts.alias.insert(d.local, s.local);
                     }
+                    // A cast between 64-bit integer types (`i as usize`) keeps
+                    // the bits, and every fact here is about the bits, so the
+                    // result is an alias too: a bound proven for the index
+                    // (`idx < 16` passed) is then known for `i`, and the next
+                    // `i as usize` is already in range.
+                    Rvalue::Cast { op: Operand::Copy(s) | Operand::Move(s), kind: CastKind::IntToInt, to, .. }
+                        if s.proj.is_empty()
+                            && !later_writes.contains(&s.local)
+                            && !killed.contains(&s.local)
+                            && matches!(to.int_width_sign(), Some((8, _)))
+                            && matches!(
+                                locals.get(s.local as usize).and_then(|l| l.ty.int_width_sign()),
+                                Some((8, _))
+                            ) =>
+                    {
+                        facts.alias.insert(d.local, s.local);
+                    }
                     Rvalue::Binary(BinOp::Eq, a, b) => {
                         if let Some(x) = zero_eq_source(a, b) {
                             facts.iszero.insert(d.local, x);
-                        }
-                    }
-                    // `d = x & M` with `M` a non-negative constant: `d`'s value
-                    // is in `[0, M]` (a bitwise and cannot set a bit above
-                    // `M`'s highest).
-                    Rvalue::Binary(BinOp::BitAnd, a, b) => {
-                        let const_of = |o: &Operand| match o {
-                            Operand::Const(Const::Int(v)) if *v >= 0 => Some(*v as u64),
-                            _ => None,
-                        };
-                        let bound = const_of(a).or_else(|| const_of(b));
-                        if let Some(m) = bound {
-                            facts.masked.insert(d.local, m);
-                        }
-                    }
-                    // `d = x as T (IntToInt)` widens an already-bounded value:
-                    // `x & 255` stays in `[0, 255]` after the `as usize` the
-                    // index path inserts, so the bound must follow the cast or
-                    // the check below would not see it.
-                    Rvalue::Cast { op, kind: CastKind::IntToInt, .. } => {
-                        if let Some(x) = whole_local(op) {
-                            if let Some(m) = facts.masked.get(&x).copied() {
-                                facts.masked.insert(d.local, m);
-                            }
                         }
                     }
                     // `b = (x < LEN)` with `LEN` a non-negative constant: the
@@ -6997,12 +7102,85 @@ fn facts_at_term(
                             }
                         }
                     }
+                    // `b = (x <= K)` is `x < K + 1`.
+                    Rvalue::Binary(BinOp::Le, a, b) => {
+                        if let (Some(x), Operand::Const(Const::Int(k))) = (whole_local(a), b) {
+                            if *k >= 0 && *k < i64::MAX {
+                                facts.lt.insert(d.local, (x, *k as u64 + 1));
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
     Some(facts)
+}
+
+/// What `facts` prove about the value `rv` computes: an upper bound when it is
+/// in `[0, bound]`, and whether it is non-negative. `None` when nothing is
+/// known.
+///
+/// Arithmetic on bounded non-negative values stays bounded: `life`'s index
+/// `(y & 127) * 128 + (x & 127)` is at most 16383, so its check against 16384
+/// is redundant. Every bound is computed without overflow and kept within
+/// `i64`, so the value reads the same as signed or unsigned and no wrapping can
+/// have happened.
+fn rv_range(facts: &AssertFacts, rv: &Rvalue) -> Option<(Option<u64>, bool)> {
+    let fits = |m: u64| m <= i64::MAX as u64;
+    let (bound, nonneg) = match rv {
+        Rvalue::Use(op) => (facts.bound_of(op), facts.nonneg_of(op)),
+        // A cast keeps a bound when the value fits the target: an unsigned
+        // target can only shrink a non-negative value, but a signed target
+        // narrower than the bound could make it negative (`255 as i8`).
+        Rvalue::Cast { op, kind: CastKind::IntToInt, to, .. } => {
+            let b = facts.bound_of(op);
+            let keep = |m: u64| match to.int_width_sign() {
+                Some((w, true)) if w < 8 => m < (1u64 << (8 * w as u32 - 1)),
+                Some(_) => true,
+                None => false,
+            };
+            let nn = facts.nonneg_of(op) && matches!(to.int_width_sign(), Some((8, _)));
+            match b {
+                Some(m) if keep(m) => (Some(m), true),
+                _ => (None, nn),
+            }
+        }
+        Rvalue::Binary(op, a, b) => {
+            let (ba, bb) = (facts.bound_of(a), facts.bound_of(b));
+            // `bb` is an upper bound of `b`, which is its value only for a
+            // constant. Division and a right shift shrink by `b`, so they need
+            // the exact value; the others grow monotonically with `b`, so its
+            // bound suffices (and a remainder is below its divisor whatever it
+            // is).
+            let b_exact = matches!(b, Operand::Const(Const::Int(_)));
+            let bound = match (op, ba, bb) {
+                (BinOp::BitAnd, Some(x), Some(y)) => Some(x.min(y)),
+                (BinOp::BitAnd, Some(x), None) | (BinOp::BitAnd, None, Some(x)) => Some(x),
+                (BinOp::Add, Some(x), Some(y)) => x.checked_add(y),
+                (BinOp::Mul, Some(x), Some(y)) => x.checked_mul(y),
+                (BinOp::Shl, Some(x), Some(k)) if k < 63 => x.checked_mul(1u64 << k),
+                (BinOp::Shr, Some(x), Some(k)) if b_exact && k < 64 => Some(x >> k),
+                (BinOp::Div, Some(x), Some(c)) if b_exact && c > 0 => Some(x / c),
+                // A non-negative value shifted right by any count, or divided
+                // by any non-negative divisor (zero panics first), does not
+                // grow.
+                (BinOp::Shr, Some(x), _) => Some(x),
+                (BinOp::Div, Some(x), Some(_)) => Some(x),
+                (BinOp::Rem, Some(x), Some(c)) if c > 0 => Some(x.min(c - 1)),
+                (BinOp::BitOr, Some(x), Some(y)) => Some(u64::MAX >> x.max(y).leading_zeros()),
+                _ => None,
+            };
+            (bound.filter(|m| fits(*m)), false)
+        }
+        _ => return None,
+    };
+    let nonneg = nonneg || bound.is_some();
+    if bound.is_none() && !nonneg {
+        return None;
+    }
+    Some((bound, nonneg))
 }
 
 /// For `Eq(a, b)` where one operand is the constant `0`, the local the other
@@ -7058,7 +7236,18 @@ fn edges_with_facts(t: &Terminator) -> Vec<(u32, EdgeFact)> {
         }
         Terminator::Goto(b) => vec![(*b, EdgeFact::None)],
         Terminator::Call { target, .. } => target.iter().map(|b| (*b, EdgeFact::None)).collect(),
-        Terminator::Assert { target, .. } => vec![(*target, EdgeFact::None)],
+        // Past an assertion its condition is known: non-zero, or zero for
+        // `assert(!c)`. rustc tests one `idx < len` and asserts on it before
+        // each of several accesses at that index; all but the first are then
+        // provably redundant.
+        Terminator::Assert { cond, negate, target } => {
+            let fact = match operand_place(cond).filter(|p| p.proj.is_empty()) {
+                Some(p) if *negate => EdgeFact::Zero(p.local),
+                Some(p) => EdgeFact::NonZero(p.local),
+                None => EdgeFact::None,
+            };
+            vec![(*target, fact)]
+        }
         Terminator::Drop { target, .. } => vec![(*target, EdgeFact::None)],
         Terminator::Return | Terminator::Unreachable | Terminator::Abort => Vec::new(),
     }
@@ -7869,7 +8058,7 @@ mod tests {
         // survive the `as usize` cast the index path inserts, or the check is
         // kept and the loop pays a compare-and-branch every iteration.
         let text = "\
-fn main() -> () {
+fn main(_6: i64) -> () {
     let mut _0: ();
     let mut _1: [i64; 256];
     let mut _2: i64;
@@ -7878,7 +8067,7 @@ fn main() -> () {
     let mut _5: bool;
 
     bb0: {
-        _2 = const 3_i64;
+        _2 = copy _6;
         _3 = BitAnd(move _2, const 255_i64);
         _4 = move _3 as usize (IntToInt);
         _5 = Lt(copy _4, const 256_usize);
@@ -7899,8 +8088,238 @@ fn main() -> () {
         );
     }
 
+    /// `life`'s neighbour index: `(y & 127) * 128 + (x & 127)` is at most
+    /// 16383, so the check against 16384 is redundant; against 16383 it is not.
+    fn grid_index_fixture(len: u64) -> String {
+        format!(
+            "\
+fn main(_10: i64) -> () {{
+    let mut _0: ();
+    let mut _1: i64;
+    let mut _2: i64;
+    let mut _3: i64;
+    let mut _4: i64;
+    let mut _5: i64;
+    let mut _6: i64;
+    let mut _7: usize;
+    let mut _8: bool;
+    let mut _9: i64;
+
+    bb0: {{
+        _9 = copy _10;
+        _1 = BitAnd(copy _9, const 127_i64);
+        _2 = Add(copy _9, const 1_i64);
+        _3 = BitAnd(move _2, const 127_i64);
+        _4 = Mul(copy _1, const 128_i64);
+        _5 = Add(move _4, copy _3);
+        _6 = Shr(copy _5, const 0_i32);
+        _7 = move _6 as usize (IntToInt);
+        _8 = Lt(copy _7, const {len}_usize);
+        assert(move _8, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }}
+
+    bb1: {{
+        _0 = ();
+        return;
+    }}
+}}
+"
+        )
+    }
+
+    #[test]
+    fn a_bounded_arithmetic_index_check_is_dropped() {
+        let mut prog = parse(&grid_index_fixture(16384)).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(
+            !format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
+            "(y & 127) * 128 + (x & 127) < 16384 always holds"
+        );
+    }
+
+    #[test]
+    fn a_bounded_arithmetic_index_that_can_reach_the_length_keeps_its_check() {
+        let mut prog = parse(&grid_index_fixture(16383)).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(
+            format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
+            "the index can be 16383, so its check against 16383 must stay"
+        );
+    }
+
+    /// `while x < 128 { a[x] }` with a signed counter that starts at 0 and
+    /// steps by 1: on the loop edge `x` is in `[0, 127]`, so the check against
+    /// 128 is redundant; against 127 it is not.
+    fn counted_loop_fixture(len: u64) -> String {
+        format!(
+            "\
+fn main() -> () {{
+    let mut _0: ();
+    let mut _1: i64;
+    let mut _2: bool;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {{
+        _1 = const 0_i64;
+        goto -> bb1;
+    }}
+
+    bb1: {{
+        _2 = Lt(copy _1, const 128_i64);
+        switchInt(move _2) -> [0: bb4, otherwise: bb2];
+    }}
+
+    bb2: {{
+        _3 = copy _1 as usize (IntToInt);
+        _4 = Lt(copy _3, const {len}_usize);
+        assert(move _4, \"index out of bounds\") -> [success: bb3, unwind unreachable];
+    }}
+
+    bb3: {{
+        _1 = Add(copy _1, const 1_i64);
+        goto -> bb1;
+    }}
+
+    bb4: {{
+        _0 = ();
+        return;
+    }}
+}}
+"
+        )
+    }
+
     fn has_assert(prog: &Program) -> bool {
         prog.funcs[0].blocks.iter().any(|b| matches!(b.term, Terminator::Assert { .. }))
+    }
+
+    #[test]
+    fn a_counted_loops_index_check_is_dropped() {
+        let mut prog = parse(&counted_loop_fixture(128)).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(!has_assert(&prog), "x in [0, 127] is always below 128");
+    }
+
+    #[test]
+    fn a_counted_loops_index_that_can_reach_the_length_keeps_its_check() {
+        let mut prog = parse(&counted_loop_fixture(127)).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(has_assert(&prog), "x can be 127, so the check against 127 stays");
+    }
+
+    /// Past `assert(_4)` the bool is known true, so asserting it again (rustc
+    /// does, once per access at the same index) is redundant; and the index it
+    /// tested is known in range, so a fresh test of the same value is too.
+    #[test]
+    fn a_repeated_bounds_check_is_dropped() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: usize;
+    let mut _3: bool;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = copy _1 as usize (IntToInt);
+        _3 = Lt(copy _2, const 16_usize);
+        assert(move _3, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        assert(move _3, \"index out of bounds\") -> [success: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        _4 = copy _1 as usize (IntToInt);
+        _5 = Lt(copy _4, const 16_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb3, unwind unreachable];
+    }
+
+    bb3: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        let f = &prog.funcs[0];
+        assert!(matches!(f.blocks[0].term, Terminator::Assert { .. }), "the first check stays");
+        assert!(matches!(f.blocks[1].term, Terminator::Goto(2)), "same bool, already asserted");
+        assert!(matches!(f.blocks[2].term, Terminator::Goto(3)), "same index, already in range");
+    }
+
+    /// The knowledge ends when the index changes.
+    #[test]
+    fn a_bounds_check_after_the_index_changes_is_kept() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: usize;
+    let mut _3: bool;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = copy _1 as usize (IntToInt);
+        _3 = Lt(copy _2, const 16_usize);
+        assert(move _3, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _1 = Add(copy _1, const 1_i64);
+        _4 = copy _1 as usize (IntToInt);
+        _5 = Lt(copy _4, const 16_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        let f = &prog.funcs[0];
+        // `_1 + 1` is at most 16, which is not below 16.
+        assert!(matches!(f.blocks[1].term, Terminator::Assert { .. }));
+    }
+
+    /// A narrowing cast is not an alias: `x as u8 < 16` says nothing about `x`.
+    #[test]
+    fn a_check_on_a_truncated_index_does_not_bound_the_original() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: u8;
+    let mut _3: bool;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = copy _1 as u8 (IntToInt);
+        _3 = Lt(copy _2, const 16_u8);
+        assert(move _3, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _4 = copy _1 as usize (IntToInt);
+        _5 = Lt(copy _4, const 16_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(matches!(prog.funcs[0].blocks[1].term, Terminator::Assert { .. }));
     }
 
     /// A call's result replaces whatever was known about its destination: the
@@ -8129,7 +8548,7 @@ fn f(_1: i64, _2: i64) -> i64 {
         // can equal 256, so the check must stay. This is the guard against the
         // elision being too eager.
         let text = "\
-fn main() -> () {
+fn main(_6: i64) -> () {
     let mut _0: ();
     let mut _1: [i64; 256];
     let mut _2: i64;
@@ -8138,7 +8557,7 @@ fn main() -> () {
     let mut _5: bool;
 
     bb0: {
-        _2 = const 3_i64;
+        _2 = copy _6;
         _3 = BitAnd(move _2, const 256_i64);
         _4 = move _3 as usize (IntToInt);
         _5 = Lt(copy _4, const 256_usize);
