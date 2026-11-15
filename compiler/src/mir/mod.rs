@@ -14,6 +14,7 @@
 //! error naming the line, so an unhandled MIR shape fails loudly instead of
 //! silently miscompiling.
 
+pub mod asmopt;
 pub mod codegen;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

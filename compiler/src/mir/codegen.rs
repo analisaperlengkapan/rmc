@@ -2233,7 +2233,7 @@ impl<'a> FnGen<'a> {
         } else {
             out.push_str("  leave\n  ret\n");
         }
-        Ok(optimize(&out))
+        Ok(finish_function(&optimize(&out)))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -6680,6 +6680,39 @@ fn optimize(body: &str) -> String {
     }
     let body = step("interleave_div_pairs", interleave_div_pairs, body);
     step("suffix_imm_mem", suffix_imm_mem, body)
+}
+
+/// The last step, on a whole function (prologue, body, epilogue): the
+/// register-level clean-up in `asmopt`.
+///
+/// It runs after every text peephole and never before one. It folds an
+/// address into the access that uses it, so a frame array is then read as
+/// `-48(%rbp,%rsi,8)` and written as `-48(%rbp)`, and the slot peepholes --
+/// which take an `N(%rbp)` operand to be a scalar slot nothing else can
+/// reach -- would forward a stale value past the indexed store, or drop the
+/// element stores as unread.
+fn finish_function(text: &str) -> String {
+    let skip = std::env::var("RMC_SKIP_PEEPHOLE").unwrap_or_default();
+    if skip.split(',').any(|s| s.trim() == "asmopt") {
+        return text.to_string();
+    }
+    let t = std::time::Instant::now();
+    let (out, gave_up) = super::asmopt::optimize_or_explain(text);
+    if let (Some(line), true) = (&gave_up, std::env::var_os("RMC_TRACE_PEEPHOLE").is_some()) {
+        eprintln!("--- peephole: asmopt skipped a function, not modelled: {line}");
+    }
+    if std::env::var_os("RMC_TIME").is_some() {
+        eprintln!(
+            "{:>24} {:8.1} ms  ({} lines)",
+            "peephole:asmopt",
+            t.elapsed().as_secs_f64() * 1000.0,
+            text.lines().count()
+        );
+    }
+    if std::env::var_os("RMC_TRACE_PEEPHOLE").is_some() && out != text {
+        eprintln!("--- peephole: asmopt\n{out}");
+    }
+    suffix_imm_mem(&out)
 }
 
 /// Give every immediate-to-memory ALU instruction an explicit 64-bit suffix.
