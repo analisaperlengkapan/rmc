@@ -6220,6 +6220,324 @@ impl Function {
     }
 }
 
+/// Replace a struct or tuple local that is only ever read and written field
+/// by field (or copied whole) with one scalar local per field.
+///
+/// The back end keeps every aggregate in the frame, so `let mut p = ps[i];`
+/// followed by arithmetic on `p.x`, `p.vy`, ... loads and stores each field
+/// around every operation. As separate locals the fields are ordinary
+/// register candidates. A whole copy in (`p = copy ps[i]`) becomes one load
+/// per field and a whole copy out one store per field; when the other side is
+/// reached through an index or a pointer its address is taken once
+/// (`t = &raw ps[i]`) and the fields are accessed as `(*t).k`.
+pub fn scalarize_aggregates(prog: &mut Program) {
+    let shapes = codegen::struct_shapes(prog);
+    for f in &mut prog.funcs {
+        f.scalarize_aggregates(&shapes);
+    }
+}
+
+/// How one place mentions an aggregate that is a candidate for replacement.
+#[derive(Clone, Copy, PartialEq)]
+enum AggUse {
+    /// Not based on a candidate.
+    Other,
+    /// Exactly `a.k`.
+    Field,
+    /// `a` itself.
+    Whole,
+    /// Anything else (`a.k.j`, `a[i]`, ...).
+    Bad,
+}
+
+impl Function {
+    fn scalarize_aggregates(&mut self, shapes: &HashMap<String, Vec<Ty>>) {
+        // A field must be a full word: the inferred struct shapes are reliable
+        // for those (a narrower field built from a constant reads as `i64`).
+        let word = |t: &Ty| {
+            matches!(t, Ty::I64 | Ty::Ptr(_) | Ty::Ref(_) | Ty::F64)
+                || matches!(t.int_width_sign(), Some((8, _)))
+        };
+        let fields_of = |ty: &Ty| -> Option<Vec<Ty>> {
+            let fs: Vec<Ty> = match ty {
+                Ty::Tuple(ts) => ts.iter().map(|t| (**t).clone()).collect(),
+                Ty::Struct(n) => shapes.get(n)?.clone(),
+                _ => return None,
+            };
+            (!fs.is_empty() && fs.len() <= 8 && fs.iter().all(word)).then_some(fs)
+        };
+        let mut cand: HashMap<u32, Vec<Ty>> = HashMap::new();
+        for (l, d) in self.locals.iter().enumerate() {
+            if l == 0 || d.is_arg {
+                continue;
+            }
+            if let Some(fs) = fields_of(&d.ty) {
+                cand.insert(l as u32, fs);
+            }
+        }
+        if cand.is_empty() {
+            return;
+        }
+        // Disqualify every candidate with a use the rewrite cannot express.
+        let mut bad: HashSet<u32> = HashSet::new();
+        {
+            let class = |p: &Place| -> AggUse {
+                match cand.get(&p.local) {
+                    None => AggUse::Other,
+                    Some(fs) => match p.proj.as_slice() {
+                        [] => AggUse::Whole,
+                        [Proj::Field(k)] if (*k as usize) < fs.len() => AggUse::Field,
+                        _ => AggUse::Bad,
+                    },
+                }
+            };
+            // An operand somewhere a whole aggregate cannot be replaced.
+            let strict_op = |o: &Operand, bad: &mut HashSet<u32>| match o {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    if matches!(class(p), AggUse::Whole | AggUse::Bad) {
+                        bad.insert(p.local);
+                    }
+                }
+                Operand::Const(c) => {
+                    let mut m = HashSet::new();
+                    const_mentions(c, &mut m);
+                    bad.extend(m.into_iter().filter(|l| cand.contains_key(l)));
+                }
+                Operand::Fn(_) | Operand::Fmt { .. } => {}
+            };
+            for b in &self.blocks {
+                for st in &b.stmts {
+                    let Stmt::Assign(dest, rv) = st else { continue };
+                    let dc = class(dest);
+                    if dc == AggUse::Bad {
+                        bad.insert(dest.local);
+                    }
+                    match rv {
+                        // A whole copy: either side may be a candidate.
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                            let sc = class(src);
+                            if sc == AggUse::Bad {
+                                bad.insert(src.local);
+                            }
+                            // A field receiving a whole aggregate, or the
+                            // reverse, is not a shape this pass produces.
+                            if sc == AggUse::Whole && dc == AggUse::Field {
+                                bad.insert(src.local);
+                                bad.insert(dest.local);
+                            }
+                            if dc == AggUse::Whole && sc == AggUse::Field {
+                                bad.insert(dest.local);
+                            }
+                            if dc == AggUse::Whole && src.local == dest.local {
+                                bad.insert(dest.local);
+                            }
+                        }
+                        // A literal: one operand per field, none reading the
+                        // aggregate being built.
+                        Rvalue::Aggregate(ops) if dc == AggUse::Whole => {
+                            let n = cand[&dest.local].len();
+                            let mut m = HashSet::new();
+                            ops.iter().for_each(|o| operand_mentions(o, &mut m));
+                            if ops.len() != n || m.contains(&dest.local) {
+                                bad.insert(dest.local);
+                            }
+                            ops.iter().for_each(|o| strict_op(o, &mut bad));
+                        }
+                        _ => {
+                            if dc == AggUse::Whole {
+                                bad.insert(dest.local);
+                            }
+                            match rv {
+                                Rvalue::Ref { place, .. }
+                                | Rvalue::RawRef { place, .. }
+                                | Rvalue::Len(place)
+                                | Rvalue::Discriminant(place) => {
+                                    if cand.contains_key(&place.local) {
+                                        bad.insert(place.local);
+                                    }
+                                }
+                                _ => scan_rv_operands(rv, &mut |o| strict_op(o, &mut bad)),
+                            }
+                        }
+                    }
+                }
+                match &b.term {
+                    Terminator::SwitchInt { discr, .. } => strict_op(discr, &mut bad),
+                    Terminator::Assert { cond, .. } => strict_op(cond, &mut bad),
+                    Terminator::Drop { place, .. } => {
+                        if cand.contains_key(&place.local) {
+                            bad.insert(place.local);
+                        }
+                    }
+                    Terminator::Call { dest, func, args, .. } => {
+                        if matches!(class(dest), AggUse::Whole | AggUse::Bad) {
+                            bad.insert(dest.local);
+                        }
+                        if let CallTarget::Indirect(Some(o)) = func {
+                            strict_op(o, &mut bad);
+                        }
+                        args.iter().for_each(|o| strict_op(o, &mut bad));
+                    }
+                    Terminator::Goto(_)
+                    | Terminator::Return
+                    | Terminator::Unreachable
+                    | Terminator::Abort => {}
+                }
+            }
+        }
+        cand.retain(|l, _| !bad.contains(l));
+        if cand.is_empty() {
+            return;
+        }
+
+        // One local per field.
+        let mut parts: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut order: Vec<u32> = cand.keys().copied().collect();
+        order.sort_unstable();
+        for a in order {
+            let ids: Vec<u32> = cand[&a]
+                .iter()
+                .map(|t| {
+                    let id = self.locals.len() as u32;
+                    self.locals.push(LocalDecl { ty: Box::new(t.clone()), is_arg: false, name: None });
+                    id
+                })
+                .collect();
+            parts.insert(a, ids);
+        }
+        let whole = |l: u32| Place { local: l, proj: Vec::new() };
+        // `a.k` -> the field's local.
+        let fix_place = |p: &mut Place| {
+            if let (Some(ids), [Proj::Field(k)]) = (parts.get(&p.local), p.proj.as_slice()) {
+                *p = whole(ids[*k as usize]);
+            }
+        };
+        let fix_op = |o: &mut Operand| {
+            if let Operand::Copy(p) | Operand::Move(p) = o {
+                fix_place(p);
+            }
+        };
+        // Whether reaching a place computes an address worth taking once.
+        let indirect = |p: &Place| {
+            p.proj.iter().any(|x| matches!(x, Proj::IndexLocal(_) | Proj::Deref))
+        };
+        let field_of = |p: &Place, k: usize| {
+            let mut q = p.clone();
+            q.proj.push(Proj::Field(k as u32));
+            q
+        };
+        let nblocks = self.blocks.len();
+        for bi in 0..nblocks {
+            let stmts = std::mem::take(&mut self.blocks[bi].stmts);
+            let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
+            for st in stmts {
+                let Stmt::Assign(mut dest, mut rv) = st else {
+                    out.push(st);
+                    continue;
+                };
+                let dest_whole = dest.proj.is_empty() && parts.contains_key(&dest.local);
+                let src_whole = match &rv {
+                    Rvalue::Use(Operand::Copy(s) | Operand::Move(s)) => {
+                        s.proj.is_empty() && parts.contains_key(&s.local)
+                    }
+                    _ => false,
+                };
+                match rv {
+                    // `a = copy b`, both replaced: field to field.
+                    Rvalue::Use(Operand::Copy(ref s) | Operand::Move(ref s)) if dest_whole && src_whole => {
+                        let (da, sa) = (parts[&dest.local].clone(), parts[&s.local].clone());
+                        for (d, sfield) in da.into_iter().zip(sa) {
+                            out.push(Stmt::Assign(whole(d), Rvalue::Use(Operand::Copy(whole(sfield)))));
+                        }
+                    }
+                    // `a = copy place`: one load per field.
+                    Rvalue::Use(Operand::Copy(ref s) | Operand::Move(ref s)) if dest_whole => {
+                        let ids = parts[&dest.local].clone();
+                        let base = if indirect(s) {
+                            let ty = self.locals[dest.local as usize].ty.clone();
+                            let t = self.locals.len() as u32;
+                            self.locals.push(LocalDecl { ty: Box::new(Ty::Ptr(ty)), is_arg: false, name: None });
+                            out.push(Stmt::Assign(whole(t), Rvalue::RawRef { mutbl: false, place: s.clone() }));
+                            Place { local: t, proj: vec![Proj::Deref] }
+                        } else {
+                            s.clone()
+                        };
+                        for (k, d) in ids.into_iter().enumerate() {
+                            out.push(Stmt::Assign(whole(d), Rvalue::Use(Operand::Copy(field_of(&base, k)))));
+                        }
+                    }
+                    // `place = copy a`: one store per field.
+                    Rvalue::Use(Operand::Copy(ref s) | Operand::Move(ref s)) if src_whole => {
+                        let ids = parts[&s.local].clone();
+                        let base = if indirect(&dest) {
+                            let ty = self.locals[s.local as usize].ty.clone();
+                            let t = self.locals.len() as u32;
+                            self.locals.push(LocalDecl { ty: Box::new(Ty::Ptr(ty)), is_arg: false, name: None });
+                            out.push(Stmt::Assign(whole(t), Rvalue::RawRef { mutbl: true, place: dest.clone() }));
+                            Place { local: t, proj: vec![Proj::Deref] }
+                        } else {
+                            dest.clone()
+                        };
+                        for (k, sfield) in ids.into_iter().enumerate() {
+                            out.push(Stmt::Assign(field_of(&base, k), Rvalue::Use(Operand::Copy(whole(sfield)))));
+                        }
+                    }
+                    // `a = P { .. }`: one assignment per field.
+                    Rvalue::Aggregate(ref mut ops) if dest_whole => {
+                        let ids = parts[&dest.local].clone();
+                        for (d, mut o) in ids.into_iter().zip(std::mem::take(ops)) {
+                            fix_op(&mut o);
+                            out.push(Stmt::Assign(whole(d), Rvalue::Use(o)));
+                        }
+                    }
+                    // Anything else only names fields.
+                    _ => {
+                        fix_place(&mut dest);
+                        map_rv_operands(&mut rv, &fix_op);
+                        out.push(Stmt::Assign(dest, rv));
+                    }
+                }
+            }
+            self.blocks[bi].stmts = out;
+            match &mut self.blocks[bi].term {
+                Terminator::SwitchInt { discr, .. } => fix_op(discr),
+                Terminator::Assert { cond, .. } => fix_op(cond),
+                Terminator::Call { dest, func, args, .. } => {
+                    fix_place(dest);
+                    if let CallTarget::Indirect(Some(o)) = func {
+                        fix_op(o);
+                    }
+                    args.iter_mut().for_each(|o| fix_op(o));
+                }
+                Terminator::Goto(_)
+                | Terminator::Return
+                | Terminator::Unreachable
+                | Terminator::Abort
+                | Terminator::Drop { .. } => {}
+            }
+        }
+    }
+}
+
+/// Apply `f` to every operand of an rvalue.
+fn map_rv_operands(rv: &mut Rvalue, f: &dyn Fn(&mut Operand)) {
+    match rv {
+        Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::Cast { op: o, .. } | Rvalue::Repeat { op: o, .. } => f(o),
+        Rvalue::Binary(_, a, b) | Rvalue::WithOverflow { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            ops.iter_mut().for_each(|o| f(o))
+        }
+        Rvalue::Ref { .. }
+        | Rvalue::RawRef { .. }
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::Unsupported(_) => {}
+    }
+}
+
 /// Point every successor edge of `t` that goes to `from` at `to`.
 fn retarget(t: &mut Terminator, from: u32, to: u32) {
     let fix = |b: &mut u32| {
@@ -8385,6 +8703,74 @@ fn main(_1: i64) -> () {
         let mut prog = parse(text).expect("fixture parses");
         drop_redundant_asserts(&mut prog);
         assert!(has_assert(&prog), "_2 is 1000 when the check runs");
+    }
+
+    /// `p = copy a[i]; p.0 = p.0 + p.1; a[i] = copy p` with `p: (i64, i64)`:
+    /// the tuple becomes two scalars, loaded and stored through one address
+    /// taken per whole copy.
+    #[test]
+    fn a_field_only_aggregate_becomes_scalars() {
+        let text = "\
+fn main(_1: usize) -> () {
+    let mut _0: ();
+    let mut _2: [(i64, i64); 4];
+    let mut _3: (i64, i64);
+
+    bb0: {
+        _3 = copy _2[_1];
+        (_3.0: i64) = Add(copy (_3.0: i64), copy (_3.1: i64));
+        _2[_1] = copy _3;
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        scalarize_aggregates(&mut prog);
+        let f = &prog.funcs[0];
+        let st = &f.blocks[0].stmts;
+        // address, two loads, the add, address, two stores.
+        assert_eq!(st.len(), 7, "{st:?}");
+        assert!(matches!(&st[0], Stmt::Assign(_, Rvalue::RawRef { place, .. }) if place.local == 2));
+        let mentions_tuple = st.iter().any(|s| {
+            let mut m = HashSet::new();
+            if let Stmt::Assign(p, rv) = s {
+                place_mentions(p, &mut m);
+                rvalue_mentions(rv, &mut m);
+            }
+            m.contains(&3)
+        });
+        assert!(!mentions_tuple, "`_3` is gone: {st:?}");
+        assert!(matches!(&st[3], Stmt::Assign(d, Rvalue::Binary(BinOp::Add, ..)) if d.proj.is_empty()));
+        assert!(matches!(&st[6], Stmt::Assign(d, Rvalue::Use(_)) if d.proj == vec![Proj::Deref, Proj::Field(1)]));
+    }
+
+    /// An aggregate whose address is taken, or that a call receives, stays
+    /// whole.
+    #[test]
+    fn an_aggregate_used_whole_is_left_alone() {
+        let text = "\
+fn main(_1: i64) -> () {
+    let mut _0: ();
+    let mut _2: (i64, i64);
+    let mut _3: &(i64, i64);
+    let mut _4: (i64, i64);
+
+    bb0: {
+        (_2.0: i64) = copy _1;
+        _3 = &_2;
+        (_4.0: i64) = copy _1;
+        _0 = take(move _4) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        let before = format!("{:?}", prog.funcs[0].blocks);
+        scalarize_aggregates(&mut prog);
+        assert_eq!(format!("{:?}", prog.funcs[0].blocks), before);
     }
 
     /// A function with twelve arguments live through one loop (they are summed

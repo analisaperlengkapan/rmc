@@ -709,6 +709,15 @@ fn collect_templates_rv(rv: &Rvalue, order: &mut Vec<Vec<u8>>, map: &mut HashMap
     }
 }
 
+/// Struct name -> field types as the back end lays them out, for the MIR
+/// passes. Enums and structs whose shape was never seen are left out.
+pub(crate) fn struct_shapes(prog: &Program) -> HashMap<String, Vec<Ty>> {
+    let enums = collect_enums(prog);
+    let mut shapes = collect_structs(prog, &enums);
+    shapes.retain(|name, fields| !enums.contains_key(name) && !fields.is_empty());
+    shapes
+}
+
 /// Struct name -> field types, learned from aggregate constructions.
 fn collect_structs(prog: &Program, enums: &HashMap<String, EnumLayout>) -> HashMap<String, Vec<Ty>> {
     let mut structs: HashMap<String, Vec<Ty>> = HashMap::new();
