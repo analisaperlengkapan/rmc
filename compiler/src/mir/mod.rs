@@ -5772,6 +5772,13 @@ impl Function {
     /// Every natural loop in the function, with the preheader when it has
     /// exactly one entry.
     fn natural_loops(&self) -> Vec<LoopInfo> {
+        self.loop_infos(false)
+    }
+
+    /// `natural_loops`, or with `general` also the loops it leaves out: a
+    /// single block that branches to itself, and a header with several back
+    /// edges (the loop is then the union over its latches).
+    fn loop_infos(&self, general: bool) -> Vec<LoopInfo> {
         let n = self.blocks.len();
         let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
         let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -5828,13 +5835,13 @@ impl Function {
             let backs: Vec<u32> = preds[h]
                 .iter()
                 .copied()
-                .filter(|&u| u != h as u32 && dom[u as usize].contains(&h))
+                .filter(|&u| (general || u != h as u32) && dom[u as usize].contains(&h))
                 .collect();
-            if backs.len() != 1 {
+            if backs.is_empty() || (!general && backs.len() != 1) {
                 continue;
             }
-            let latch = backs[0];
-            let in_loop = |b: usize| dom[b].contains(&h) && reach[b][latch as usize];
+            let in_loop =
+                |b: usize| dom[b].contains(&h) && backs.iter().any(|l| reach[b][*l as usize]);
             let mut blocks: HashSet<u32> = HashSet::new();
             for b in 0..n {
                 if in_loop(b) {
@@ -5850,6 +5857,394 @@ impl Function {
             loops.push(LoopInfo { header: h as u32, blocks, preheader });
         }
         loops
+    }
+}
+
+/// Every local a place mentions: its base and its index locals.
+fn place_mentions(p: &Place, out: &mut HashSet<u32>) {
+    out.insert(p.local);
+    for pr in &p.proj {
+        if let Proj::IndexLocal(i) = pr {
+            out.insert(*i);
+        }
+    }
+}
+
+/// Every local an operand mentions, including those inside an aggregate
+/// constant or an allocation's place.
+fn operand_mentions(op: &Operand, out: &mut HashSet<u32>) {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => place_mentions(p, out),
+        Operand::Const(c) => const_mentions(c, out),
+        Operand::Fn(_) | Operand::Fmt { .. } => {}
+    }
+}
+
+fn const_mentions(c: &Const, out: &mut HashSet<u32>) {
+    match c {
+        Const::Alloc { place: Some(p), .. } => place_mentions(p, out),
+        Const::Agg { ops, .. } => ops.iter().for_each(|o| operand_mentions(o, out)),
+        Const::Int(_)
+        | Const::Bool(_)
+        | Const::Float(..)
+        | Const::Char(_)
+        | Const::Unit
+        | Const::Str(_)
+        | Const::Alloc { place: None, .. }
+        | Const::Named(_)
+        | Const::Bytes(_)
+        | Const::Zst => {}
+    }
+}
+
+/// Every local an rvalue mentions.
+fn rvalue_mentions(rv: &Rvalue, out: &mut HashSet<u32>) {
+    match rv {
+        Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::Cast { op: o, .. } | Rvalue::Repeat { op: o, .. } => {
+            operand_mentions(o, out)
+        }
+        Rvalue::Binary(_, a, b) | Rvalue::WithOverflow { a, b, .. } => {
+            operand_mentions(a, out);
+            operand_mentions(b, out);
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } | Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            place_mentions(place, out)
+        }
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            ops.iter().for_each(|o| operand_mentions(o, out))
+        }
+        Rvalue::Unsupported(_) => {}
+    }
+}
+
+/// Every local a terminator mentions, read or written.
+fn term_mentions(t: &Terminator, out: &mut HashSet<u32>) {
+    match t {
+        Terminator::Goto(_) | Terminator::Unreachable | Terminator::Abort => {}
+        // `return` reads the return place.
+        Terminator::Return => {
+            out.insert(0);
+        }
+        Terminator::SwitchInt { discr, .. } => operand_mentions(discr, out),
+        Terminator::Assert { cond, .. } => operand_mentions(cond, out),
+        Terminator::Drop { place, .. } => place_mentions(place, out),
+        Terminator::Call { dest, func, args, .. } => {
+            place_mentions(dest, out);
+            if let CallTarget::Indirect(Some(o)) = func {
+                operand_mentions(o, out);
+            }
+            args.iter().for_each(|o| operand_mentions(o, out));
+        }
+    }
+}
+
+impl Function {
+    /// The locals live on entry to each block. A whole-local assignment (or a
+    /// call writing a whole local) is a definition; every other mention is a
+    /// read, which over-approximates (a borrow counts as a read), so a local
+    /// reported dead really is.
+    fn live_in(&self) -> Vec<HashSet<u32>> {
+        let n = self.blocks.len();
+        let mut uses: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        let mut defs: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let (u, d) = (&mut uses[bi], &mut defs[bi]);
+            let read = |m: HashSet<u32>, u: &mut HashSet<u32>, d: &HashSet<u32>| {
+                for l in m {
+                    if !d.contains(&l) {
+                        u.insert(l);
+                    }
+                }
+            };
+            for st in &b.stmts {
+                let Stmt::Assign(p, rv) = st else { continue };
+                let mut m = HashSet::new();
+                rvalue_mentions(rv, &mut m);
+                if !p.proj.is_empty() {
+                    place_mentions(p, &mut m);
+                }
+                read(m, u, d);
+                if p.proj.is_empty() {
+                    d.insert(p.local);
+                }
+            }
+            let mut m = HashSet::new();
+            term_mentions(&b.term, &mut m);
+            if let Terminator::Call { dest, func, args, .. } = &b.term {
+                if dest.proj.is_empty() {
+                    // The destination is written, not read, unless an argument
+                    // or the callee also names it.
+                    let mut others = HashSet::new();
+                    if let CallTarget::Indirect(Some(o)) = func {
+                        operand_mentions(o, &mut others);
+                    }
+                    args.iter().for_each(|o| operand_mentions(o, &mut others));
+                    m = others;
+                    read(m, u, d);
+                    d.insert(dest.local);
+                    continue;
+                }
+            }
+            read(m, u, d);
+        }
+        let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        let mut live_in: Vec<HashSet<u32>> = uses.clone();
+        loop {
+            let mut changed = false;
+            for b in (0..n).rev() {
+                let mut out: HashSet<u32> = HashSet::new();
+                for &sc in &succ[b] {
+                    if (sc as usize) < n {
+                        out.extend(live_in[sc as usize].iter().copied());
+                    }
+                }
+                for l in out {
+                    if !defs[b].contains(&l) && live_in[b].insert(l) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        live_in
+    }
+
+    /// Whether a local can live in a register and be copied with one move.
+    fn is_register_scalar(&self, l: u32) -> bool {
+        matches!(
+            *self.locals[l as usize].ty,
+            Ty::I64 | Ty::Int { .. } | Ty::U8 | Ty::Bool | Ty::Ptr(_) | Ty::Ref(_) | Ty::F64 | Ty::F32
+        )
+    }
+
+    /// Split the live range of every value that is live through a loop without
+    /// being mentioned in it, when the loop has more live values than
+    /// registers.
+    ///
+    /// The back end gives a local one home for its whole life. A value an
+    /// inner loop never touches (an outer counter, a bound, an accumulator of
+    /// the enclosing loop) therefore held its register through the inner loop
+    /// while the loop's own temporaries went through the frame on every
+    /// iteration. For such a `v` this saves it before the loop
+    /// (`v' = copy v`) and restores it at every exit (`v = copy v'`): `v` is
+    /// then dead inside the loop and shares its register with the loop's
+    /// values, and `v'`, which is only written and read at the loop's edges,
+    /// ranks last and takes the frame slot when registers are short.
+    ///
+    /// The transformation is an identity whatever the liveness says: `v` is
+    /// not read or written in the loop, not address-taken (so nothing writes it
+    /// through a pointer), and the save dominates every restore.
+    fn split_loop_ranges(&mut self) {
+        // The allocatable registers, and those that survive a call
+        // (`mir/codegen.rs`: `PROMOTE_REGS` + `CALLER_REGS`, `PROMOTE_REGS`).
+        const REGS: usize = 9;
+        const CALL_REGS: usize = 5;
+        let mut loops = self.loop_infos(true);
+        if loops.is_empty() {
+            return;
+        }
+        // Outermost first, so an inner loop sees the outer split's result: the
+        // value is already dead there.
+        loops.sort_by(|a, b| b.blocks.len().cmp(&a.blocks.len()).then(a.header.cmp(&b.header)));
+        let escaped = self.escaped_locals();
+        let first_new = self.locals.len() as u32;
+        for li in 0..loops.len() {
+            let header = loops[li].header;
+            let in_loop = loops[li].blocks.clone();
+            let live_in = self.live_in();
+            let mut mentioned: HashSet<u32> = HashSet::new();
+            for &b in &in_loop {
+                let blk = &self.blocks[b as usize];
+                for st in &blk.stmts {
+                    if let Stmt::Assign(p, rv) = st {
+                        place_mentions(p, &mut mentioned);
+                        rvalue_mentions(rv, &mut mentioned);
+                    }
+                }
+                term_mentions(&blk.term, &mut mentioned);
+            }
+            let mut through: Vec<u32> = live_in[header as usize]
+                .iter()
+                .copied()
+                .filter(|l| {
+                    !mentioned.contains(l)
+                        && *l < first_new
+                        && !escaped.contains(l)
+                        && self.is_register_scalar(*l)
+                })
+                .collect();
+            if through.is_empty() {
+                continue;
+            }
+            through.sort_unstable();
+            // Pressure: the most register candidates live at once anywhere in
+            // the loop, and the most live across one of its calls.
+            let cand = |l: &u32| !escaped.contains(l) && self.is_register_scalar(*l);
+            let succ_of = |b: u32| successors(&self.blocks[b as usize].term);
+            let (mut max_live, mut max_call) = (0usize, 0usize);
+            for &b in &in_loop {
+                let blk = &self.blocks[b as usize];
+                let mut live: HashSet<u32> = HashSet::new();
+                for sc in succ_of(b) {
+                    if let Some(s) = live_in.get(sc as usize) {
+                        live.extend(s.iter().copied().filter(|l| cand(l)));
+                    }
+                }
+                if matches!(blk.term, Terminator::Call { .. } | Terminator::Drop { .. }) {
+                    let dest = match &blk.term {
+                        Terminator::Call { dest, .. } if dest.proj.is_empty() => Some(dest.local),
+                        _ => None,
+                    };
+                    let across = live.iter().filter(|l| Some(**l) != dest).count();
+                    max_call = max_call.max(across);
+                }
+                let mut m = HashSet::new();
+                term_mentions(&blk.term, &mut m);
+                live.extend(m.into_iter().filter(|l| cand(l)));
+                max_live = max_live.max(live.len());
+                for st in blk.stmts.iter().rev() {
+                    let Stmt::Assign(p, rv) = st else { continue };
+                    if p.proj.is_empty() {
+                        live.remove(&p.local);
+                    }
+                    let mut m = HashSet::new();
+                    rvalue_mentions(rv, &mut m);
+                    if !p.proj.is_empty() {
+                        place_mentions(p, &mut m);
+                    }
+                    live.extend(m.into_iter().filter(|l| cand(l)));
+                    max_live = max_live.max(live.len());
+                }
+            }
+            if max_live <= REGS && max_call <= CALL_REGS {
+                continue;
+            }
+
+            // Predecessors, for the entry and exit edges.
+            let n = self.blocks.len();
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+            for b in 0..n as u32 {
+                for sc in succ_of(b) {
+                    if (sc as usize) < n && !preds[sc as usize].contains(&b) {
+                        preds[sc as usize].push(b);
+                    }
+                }
+            }
+            let entries: Vec<u32> =
+                preds[header as usize].iter().copied().filter(|p| !in_loop.contains(p)).collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let mut exits: Vec<(u32, u32)> = Vec::new();
+            for &b in &in_loop {
+                for sc in succ_of(b) {
+                    if !in_loop.contains(&sc) && !exits.contains(&(b, sc)) {
+                        exits.push((b, sc));
+                    }
+                }
+            }
+            exits.sort_unstable();
+
+            let saved: Vec<(u32, u32)> = through
+                .iter()
+                .map(|&v| {
+                    let ty = self.locals[v as usize].ty.clone();
+                    let s = self.locals.len() as u32;
+                    self.locals.push(LocalDecl { ty, is_arg: false, name: None });
+                    (v, s)
+                })
+                .collect();
+            let whole = |l: u32| Place { local: l, proj: Vec::new() };
+            let save: Vec<Stmt> = saved
+                .iter()
+                .map(|&(v, s)| Stmt::Assign(whole(s), Rvalue::Use(Operand::Copy(whole(v)))))
+                .collect();
+            let restore: Vec<Stmt> = saved
+                .iter()
+                .map(|&(v, s)| Stmt::Assign(whole(v), Rvalue::Use(Operand::Copy(whole(s)))))
+                .collect();
+
+            // A new block on the edge `from -> to`, kept inside every loop that
+            // contains both ends.
+            let edge_block = |me: &mut Function, loops: &mut Vec<LoopInfo>, from: u32, to: u32, stmts: Vec<Stmt>| {
+                let nb = me.blocks.len() as u32;
+                me.blocks.push(BasicBlock { stmts, term: Terminator::Goto(to) });
+                retarget(&mut me.blocks[from as usize].term, to, nb);
+                for l in loops.iter_mut() {
+                    if l.blocks.contains(&from) && l.blocks.contains(&to) {
+                        l.blocks.insert(nb);
+                    }
+                }
+            };
+
+            // Save at the end of each entry block, or on the edge when the
+            // block's own terminator writes one of the values (a call result).
+            let mut save_blocks: HashSet<u32> = HashSet::new();
+            for &e in &entries {
+                let writes = match &self.blocks[e as usize].term {
+                    Terminator::Call { dest, .. } => through.contains(&dest.local),
+                    _ => false,
+                };
+                if writes {
+                    edge_block(self, &mut loops, e, header, save.clone());
+                } else {
+                    self.blocks[e as usize].stmts.extend(save.iter().cloned());
+                    save_blocks.insert(e);
+                }
+            }
+            // Restore at the start of an exit target every one of whose
+            // predecessors either is in the loop or ran the save just before
+            // branching there; otherwise on the edge.
+            let mut restored: HashSet<u32> = HashSet::new();
+            for &(from, to) in &exits {
+                if restored.contains(&to) {
+                    continue;
+                }
+                let direct = preds[to as usize]
+                    .iter()
+                    .all(|q| in_loop.contains(q) || save_blocks.contains(q));
+                if direct {
+                    let blk = &mut self.blocks[to as usize];
+                    let mut st = restore.clone();
+                    st.append(&mut blk.stmts);
+                    blk.stmts = st;
+                    restored.insert(to);
+                } else {
+                    edge_block(self, &mut loops, from, to, restore.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Point every successor edge of `t` that goes to `from` at `to`.
+fn retarget(t: &mut Terminator, from: u32, to: u32) {
+    let fix = |b: &mut u32| {
+        if *b == from {
+            *b = to;
+        }
+    };
+    match t {
+        Terminator::Goto(b) => fix(b),
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.iter_mut().for_each(|(_, b)| fix(b));
+            fix(otherwise);
+        }
+        Terminator::Call { target, .. } => {
+            if let Some(b) = target {
+                fix(b);
+            }
+        }
+        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => fix(target),
+        Terminator::Return | Terminator::Unreachable | Terminator::Abort => {}
+    }
+}
+
+pub fn split_loop_ranges(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.split_loop_ranges();
     }
 }
 
@@ -7570,6 +7965,161 @@ fn main(_1: i64) -> () {
         let mut prog = parse(text).expect("fixture parses");
         drop_redundant_asserts(&mut prog);
         assert!(has_assert(&prog), "_2 is 1000 when the check runs");
+    }
+
+    /// A function with twelve arguments live through one loop (they are summed
+    /// after it), so the loop has more live values than registers. `entry` is
+    /// the text of `bb0`, which must lead to the loop header `bb1`; the loop
+    /// exits to `bb2`.
+    fn pressure_fixture(entry: &str, extra: &str) -> String {
+        let args: Vec<String> = (1..=12).map(|i| format!("_{i}: i64")).collect();
+        let mut sum = String::from("        _0 = copy _1;\n");
+        for i in 2..=12 {
+            sum.push_str(&format!("        _0 = Add(copy _0, copy _{i});\n"));
+        }
+        format!(
+            "\
+fn f({}) -> i64 {{
+    let mut _0: i64;
+    let mut _13: i64;
+    let mut _14: bool;
+    let mut _15: i64;
+
+{entry}
+    bb1: {{
+        _13 = Add(copy _13, const 1_i64);
+        _14 = Lt(copy _13, const 100_i64);
+        switchInt(move _14) -> [0: bb2, otherwise: bb1];
+    }}
+
+    bb2: {{
+{sum}        _0 = Add(copy _0, copy _13);
+        return;
+    }}
+{extra}}}
+",
+            args.join(", ")
+        )
+    }
+
+    fn is_copy(s: &Stmt, to: u32, from: u32) -> bool {
+        matches!(s, Stmt::Assign(d, Rvalue::Use(Operand::Copy(q)))
+            if d.proj.is_empty() && q.proj.is_empty() && d.local == to && q.local == from)
+    }
+
+    /// Values live through a loop that never mentions them are saved in the
+    /// entry block and restored at the exit, so they are dead inside the loop.
+    #[test]
+    fn values_live_through_a_crowded_loop_are_saved_and_restored() {
+        let entry = "    bb0: {\n        _13 = const 0_i64;\n        goto -> bb1;\n    }\n";
+        let mut prog = parse(&pressure_fixture(entry, "")).expect("fixture parses");
+        let before = prog.funcs[0].locals.len() as u32;
+        split_loop_ranges(&mut prog);
+        let f = &prog.funcs[0];
+        // `_1` .. `_12` each get a save in `bb0` and a restore at the top of `bb2`.
+        assert_eq!(f.locals.len() as u32, before + 12);
+        for v in 1..=12u32 {
+            let s = before + (v - 1);
+            assert!(f.blocks[0].stmts.iter().any(|st| is_copy(st, s, v)), "save of _{v}");
+            assert!(is_copy(&f.blocks[2].stmts[(v - 1) as usize], v, s), "restore of _{v}");
+        }
+        // The loop itself is untouched and mentions none of them.
+        assert_eq!(f.blocks[1].stmts.len(), 2);
+        // The loop's own counter is not split.
+        assert!(!f.blocks[0].stmts.iter().any(|st| matches!(st, Stmt::Assign(_, Rvalue::Use(Operand::Copy(q))) if q.local == 13)));
+    }
+
+    /// A loop with few live values is left alone: there is a register for
+    /// everything, so the copies would only cost.
+    #[test]
+    fn an_uncrowded_loop_is_not_split() {
+        let text = "\
+fn f(_1: i64, _2: i64) -> i64 {
+    let mut _0: i64;
+    let mut _3: i64;
+    let mut _4: bool;
+
+    bb0: {
+        _3 = const 0_i64;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _3 = Add(copy _3, const 1_i64);
+        _4 = Lt(copy _3, const 100_i64);
+        switchInt(move _4) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb2: {
+        _0 = Add(copy _1, copy _2);
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        let before = format!("{:?}", prog.funcs[0].blocks);
+        split_loop_ranges(&mut prog);
+        assert_eq!(format!("{:?}", prog.funcs[0].blocks), before);
+    }
+
+    /// An exit target that another path also reaches gets the restore on a
+    /// new block on the exit edge: at the target itself the save may not have
+    /// run.
+    #[test]
+    fn a_shared_exit_target_is_restored_on_the_edge() {
+        let entry = "    bb0: {\n        _13 = const 0_i64;\n        switchInt(copy _1) -> [0: bb3, otherwise: bb4];\n    }\n";
+        let extra = "\n    bb3: {\n        goto -> bb2;\n    }\n\n    bb4: {\n        _15 = const 7_i64;\n        goto -> bb1;\n    }\n";
+        let mut prog = parse(&pressure_fixture(entry, extra)).expect("fixture parses");
+        let before_blocks = prog.funcs[0].blocks.len();
+        let before = prog.funcs[0].locals.len() as u32;
+        split_loop_ranges(&mut prog);
+        let f = &prog.funcs[0];
+        // The save is in the loop's only entry block, `bb4`.
+        assert!(f.blocks[4].stmts.iter().any(|st| is_copy(st, before + 1, 2)));
+        // `bb2` is also reached from `bb3`, which never ran the save: nothing
+        // is restored there.
+        assert!(!f.blocks[2].stmts.iter().any(|st| is_copy(st, 2, before + 1)));
+        // The loop now leaves through a new block that restores and continues
+        // to `bb2`.
+        assert_eq!(f.blocks.len(), before_blocks + 1);
+        let nb = before_blocks as u32;
+        assert!(matches!(&f.blocks[1].term, Terminator::SwitchInt { targets, .. } if targets[0].1 == nb));
+        assert!(matches!(f.blocks[nb as usize].term, Terminator::Goto(2)));
+        assert!(f.blocks[nb as usize].stmts.iter().any(|st| is_copy(st, 2, before + 1)));
+    }
+
+    /// When the block entering the loop ends in a call that writes one of the
+    /// values, the save goes on the edge after the call, not before it.
+    #[test]
+    fn a_value_written_by_the_entering_call_is_saved_after_it() {
+        let entry = "    bb0: {\n        _13 = const 0_i64;\n        _5 = arg_i64(const 1_i64) -> [return: bb1, unwind unreachable];\n    }\n";
+        let mut prog = parse(&pressure_fixture(entry, "")).expect("fixture parses");
+        let before_blocks = prog.funcs[0].blocks.len();
+        split_loop_ranges(&mut prog);
+        let f = &prog.funcs[0];
+        // No save was appended to `bb0`: it would copy `_5` before the call
+        // assigns it.
+        assert_eq!(f.blocks[0].stmts.len(), 1);
+        assert_eq!(f.blocks.len(), before_blocks + 1);
+        let nb = before_blocks as u32;
+        assert!(matches!(&f.blocks[0].term, Terminator::Call { target: Some(t), .. } if *t == nb));
+        assert!(matches!(f.blocks[nb as usize].term, Terminator::Goto(1)));
+        assert!(f.blocks[nb as usize].stmts.iter().any(|st| matches!(st, Stmt::Assign(_, Rvalue::Use(Operand::Copy(q))) if q.local == 5)));
+    }
+
+    /// A value whose address is taken can change through the pointer inside
+    /// the loop, so it is never saved and restored around it.
+    #[test]
+    fn an_address_taken_value_is_not_split() {
+        let entry = "    bb0: {\n        _13 = const 0_i64;\n        _15 = &raw mut _3 as i64 (PointerExposeProvenance);\n        goto -> bb1;\n    }\n";
+        let mut prog = match parse(&pressure_fixture(entry, "")) {
+            Ok(p) => p,
+            // The cast spelling is not what this test is about.
+            Err(_) => return,
+        };
+        split_loop_ranges(&mut prog);
+        let f = &prog.funcs[0];
+        assert!(!f.blocks[2].stmts.iter().any(|st| matches!(st, Stmt::Assign(d, Rvalue::Use(_)) if d.local == 3 && d.proj.is_empty())));
     }
 
     #[test]

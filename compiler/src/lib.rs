@@ -159,7 +159,7 @@ pub fn optimize_mir(prog: &mut mir::Program, o: &MirOptions) {
     let timing = std::env::var_os("RMC_TIME").is_some();
     let ovf = o.overflow_checks;
     type Pass<'a> = (&'static str, bool, &'a dyn Fn(&mut mir::Program));
-    let passes: [Pass; 14] = [
+    let passes: [Pass; 15] = [
         ("tco", o.tco, &|p| mir::tco(p, ovf)),
         ("inline", o.inline, &mir::inline_calls),
         ("coalesce_call_results", true, &mir::coalesce_call_results),
@@ -173,6 +173,7 @@ pub fn optimize_mir(prog: &mut mir::Program, o: &MirOptions) {
         ("jump_thread", true, &mir::jump_thread),
         ("prune_unreachable", true, &mir::prune_unreachable),
         ("rotate_loops", true, &mir::rotate_loops),
+        ("split_loop_ranges", true, &mir::split_loop_ranges),
         ("layout_blocks", true, &mir::layout_blocks),
     ];
     for (name, enabled, run) in passes {
