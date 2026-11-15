@@ -146,6 +146,10 @@ struct FnGen<'a> {
     interf: HashMap<u32, HashSet<u32>>,
     /// Register -> the promoted locals assigned to it.
     reg_owners: HashMap<&'static str, Vec<u32>>,
+    /// Copy-related locals (`d = copy s`, `d = s as T`): giving both the same
+    /// register turns the copy into nothing, so each is tried in the other's
+    /// register first.
+    affinity: HashMap<u32, Vec<u32>>,
     /// Whether the body jumped to the shared panic exit (`trap_label`).
     trap_used: bool,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
@@ -1279,6 +1283,7 @@ impl<'a> FnGen<'a> {
             no_share: HashSet::new(),
             interf: HashMap::new(),
             reg_owners: HashMap::new(),
+            affinity: HashMap::new(),
             trap_used: false,
             slot_map: None,
             next_slot: 0,
@@ -1758,6 +1763,7 @@ impl<'a> FnGen<'a> {
     /// evaluates them. The arguments are all defined at entry.
     fn compute_interference(&mut self) {
         let n = self.func.blocks.len();
+        let mut affinity: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut interf: HashMap<u32, HashSet<u32>> = HashMap::new();
         let edge = |a: u32, b: u32, m: &mut HashMap<u32, HashSet<u32>>| {
             if a != b {
@@ -1798,15 +1804,54 @@ impl<'a> FnGen<'a> {
                 let mut su: HashSet<u32> = HashSet::new();
                 scan_rv_uses(rv, &mut su);
                 if p.proj.is_empty() {
-                    for &o in live.iter().chain(su.iter()) {
-                        edge(p.local, o, &mut interf);
+                    // A copy or a cast reads its one operand in full before it
+                    // writes the destination, so the two may share a register
+                    // (the move is then a no-op): the operand is not an
+                    // interference by being read here. If it is also live
+                    // *after* the statement, sharing still holds for a copy
+                    // that leaves both with the same value, but not for a cast
+                    // that changes it (`x as u8` would destroy `x`).
+                    let int8 = |t: &Ty| matches!(t.int_width_sign(), Some((8, _)));
+                    let copy_of: Option<(u32, bool)> = match rv {
+                        Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) if q.proj.is_empty() => {
+                            Some((q.local, true))
+                        }
+                        Rvalue::Cast { op: Operand::Copy(q) | Operand::Move(q), to, .. }
+                            if q.proj.is_empty()
+                                && !to.is_float()
+                                && !self.local_ty(q.local).is_float()
+                                && !self.local_ty(q.local).is_aggregate() =>
+                        {
+                            Some((q.local, int8(to) && int8(&self.local_ty(q.local))))
+                        }
+                        _ => None,
+                    };
+                    for &o in su.iter() {
+                        if copy_of.map(|(q, _)| q) != Some(o) {
+                            edge(p.local, o, &mut interf);
+                        }
+                    }
+                    for &o in live.iter() {
+                        if copy_of != Some((o, true)) {
+                            edge(p.local, o, &mut interf);
+                        }
+                    }
+                    if let Some((q, _)) = copy_of {
+                        if q != p.local {
+                            affinity.entry(p.local).or_default().push(q);
+                            affinity.entry(q).or_default().push(p.local);
+                        }
                     }
                     live.remove(&p.local);
                 } else {
                     written_place_reads(p, &mut su);
                 }
+                // `&x` makes `x` addressable; `&*p` or `&(*p).f` only reads the
+                // pointer `p`.
                 if let Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } = rv {
-                    self.no_share.insert(place.local);
+                    if !matches!(place.proj.first(), Some(Proj::Deref)) {
+                        self.no_share.insert(place.local);
+                    }
                 }
                 live.extend(su);
             }
@@ -1822,6 +1867,7 @@ impl<'a> FnGen<'a> {
             }
         }
         self.interf = interf;
+        self.affinity = affinity;
     }
 
     /// The ABI register argument `local` arrives in, if any. A function that
@@ -1927,9 +1973,25 @@ impl<'a> FnGen<'a> {
             pool.extend(&callee_used);
             pool.extend(&callee_fresh);
         }
+        // A copy partner's register first: sharing it deletes the copy.
+        let mut order: Vec<&'static str> = Vec::with_capacity(pool.len());
+        if let Some(partners) = self.affinity.get(&local) {
+            for q in partners {
+                if let Some(pr) = self.promo.get(q) {
+                    if pool.contains(&pr.reg) && !order.contains(&pr.reg) {
+                        order.push(pr.reg);
+                    }
+                }
+            }
+        }
+        for r in pool {
+            if !order.contains(&r) {
+                order.push(r);
+            }
+        }
         let empty = HashSet::new();
         let mine = self.interf.get(&local).unwrap_or(&empty);
-        for reg in pool {
+        for reg in order {
             if self.const_regs.values().any(|r| *r == reg)
                 || self.const_caller_regs.values().any(|r| *r == reg)
             {
@@ -7326,17 +7388,16 @@ fn scan_rv(
                 scan_operand(op, counts, projected, index_locals);
             }
         }
-        Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } => {
-            bump(place, counts, projected);
-            addr_taken.insert(place.local);
-        }
-        Rvalue::Len(p) => {
+        // `&x`, `Len(x)` and `discriminant(x)` need `x` in memory; through a
+        // leading deref (`&*p`, `&(*p).f`) they only read the pointer `p`.
+        Rvalue::Ref { place: p, .. }
+        | Rvalue::RawRef { place: p, .. }
+        | Rvalue::Len(p)
+        | Rvalue::Discriminant(p) => {
             bump(p, counts, projected);
-            addr_taken.insert(p.local);
-        }
-        Rvalue::Discriminant(p) => {
-            bump(p, counts, projected);
-            addr_taken.insert(p.local);
+            if !matches!(p.proj.first(), Some(Proj::Deref)) {
+                addr_taken.insert(p.local);
+            }
         }
         Rvalue::WithOverflow { a, b, .. } => {
             scan_operand(a, counts, projected, index_locals);
