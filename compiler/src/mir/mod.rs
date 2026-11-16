@@ -6191,7 +6191,60 @@ impl Function {
                 if writes {
                     edge_block(self, &mut loops, e, header, save.clone());
                 } else {
-                    self.blocks[e as usize].stmts.extend(save.iter().cloned());
+                    // Each save goes right after the last statement that
+                    // mentions its value, not at the end of the block: the
+                    // entry block usually also initialises the loop's own
+                    // variables, and a value still waiting to be saved would
+                    // overlap every one of them.
+                    let stmts = &mut self.blocks[e as usize].stmts;
+                    for (&(v, _), st) in saved.iter().zip(save.iter()) {
+                        let at = stmts
+                            .iter()
+                            .rposition(|x| {
+                                let mut m = HashSet::new();
+                                if let Stmt::Assign(p, rv) = x {
+                                    place_mentions(p, &mut m);
+                                    rvalue_mentions(rv, &mut m);
+                                }
+                                m.contains(&v)
+                            })
+                            .map_or(0, |i| i + 1);
+                        stmts.insert(at, st.clone());
+                    }
+                    // The same block usually initialises the loop's own
+                    // variables (`i = 0; sum = 0`) above the last use of a
+                    // saved value. A constant assignment commutes with every
+                    // statement that does not mention its destination, so
+                    // those move below the saves, where the values they would
+                    // have overlapped are already out of their registers.
+                    let is_save = |x: &Stmt| saved.iter().any(|&(v, sv)| {
+                        matches!(x, Stmt::Assign(d, Rvalue::Use(Operand::Copy(q)))
+                            if d.proj.is_empty() && q.proj.is_empty() && d.local == sv && q.local == v)
+                    });
+                    if let Some(mut last) = stmts.iter().rposition(|x| is_save(x)) {
+                        let mut i = last;
+                        while i > 0 {
+                            i -= 1;
+                            let Stmt::Assign(d, Rvalue::Use(Operand::Const(c))) = &stmts[i] else { continue };
+                            if !d.proj.is_empty() || !matches!(c, Const::Int(_) | Const::Bool(_)) {
+                                continue;
+                            }
+                            let x = d.local;
+                            let mentioned = stmts[i + 1..=last].iter().any(|y| {
+                                let mut m = HashSet::new();
+                                if let Stmt::Assign(p, rv) = y {
+                                    place_mentions(p, &mut m);
+                                    rvalue_mentions(rv, &mut m);
+                                }
+                                m.contains(&x)
+                            });
+                            if !mentioned {
+                                let st = stmts.remove(i);
+                                stmts.insert(last, st);
+                                last -= 1;
+                            }
+                        }
+                    }
                     save_blocks.insert(e);
                 }
             }
@@ -6207,10 +6260,26 @@ impl Function {
                     .iter()
                     .all(|q| in_loop.contains(q) || save_blocks.contains(q));
                 if direct {
-                    let blk = &mut self.blocks[to as usize];
-                    let mut st = restore.clone();
-                    st.append(&mut blk.stmts);
-                    blk.stmts = st;
+                    // Each restore goes right before the first statement that
+                    // mentions its value (or at the end of the block), not at
+                    // the top: the loop's results are usually consumed first,
+                    // and a value restored while they are still live would
+                    // overlap every one of them.
+                    let stmts = &mut self.blocks[to as usize].stmts;
+                    for (&(v, _), st) in saved.iter().zip(restore.iter()) {
+                        let at = stmts
+                            .iter()
+                            .position(|x| {
+                                let mut m = HashSet::new();
+                                if let Stmt::Assign(p, rv) = x {
+                                    place_mentions(p, &mut m);
+                                    rvalue_mentions(rv, &mut m);
+                                }
+                                m.contains(&v)
+                            })
+                            .unwrap_or(stmts.len());
+                        stmts.insert(at, st.clone());
+                    }
                     restored.insert(to);
                 } else {
                     edge_block(self, &mut loops, from, to, restore.clone());
@@ -8827,7 +8896,14 @@ fn f({}) -> i64 {{
         for v in 1..=12u32 {
             let s = before + (v - 1);
             assert!(f.blocks[0].stmts.iter().any(|st| is_copy(st, s, v)), "save of _{v}");
-            assert!(is_copy(&f.blocks[2].stmts[(v - 1) as usize], v, s), "restore of _{v}");
+            // The restore sits just before the value's first use in `bb2`.
+            let at = f.blocks[2].stmts.iter().position(|st| is_copy(st, v, s)).expect("restore");
+            let mut m = HashSet::new();
+            if let Stmt::Assign(p, rv) = &f.blocks[2].stmts[at + 1] {
+                place_mentions(p, &mut m);
+                rvalue_mentions(rv, &mut m);
+            }
+            assert!(m.contains(&v), "restore of _{v} is not next to its use");
         }
         // The loop itself is untouched and mentions none of them.
         assert_eq!(f.blocks[1].stmts.len(), 2);
