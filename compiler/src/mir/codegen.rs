@@ -5331,7 +5331,10 @@ impl<'a> FnGen<'a> {
                 }
             } else {
                 let (v, _) = self.eval_operand(arg)?;
-                let stable = v.starts_with('$') || v.contains('(');
+                // An immediate, a memory operand, or a promoted local's own
+                // register: evaluating a later argument writes only scratch
+                // registers, so none of these changes before the moves below.
+                let stable = v.starts_with('$') || v.contains('(') || !SCRATCH_REGS.contains(&v.as_str());
                 if stable || Some(i) == last_unstable {
                     reg_ops.push((i, v));
                 } else {
@@ -5353,9 +5356,32 @@ impl<'a> FnGen<'a> {
                 "mir_codegen: aggregate-returning call to {name} with six arguments unsupported"
             ));
         }
-        for (i, v) in &reg_ops {
-            if ARG_REGS[*i + arg_shift] != *v {
-                self.emit(&format!("  mov {v}, {}", ARG_REGS[*i + arg_shift]));
+        let moves: Vec<(String, &str)> =
+            reg_ops.iter().map(|(i, v)| (v.clone(), ARG_REGS[*i + arg_shift])).collect();
+        match parallel_moves(moves.clone()) {
+            Some(ms) => {
+                for m in ms {
+                    self.emit(&m);
+                }
+            }
+            None => {
+                // No free scratch register to break a cycle with (not seen in
+                // practice): stash every register source in a slot first.
+                let mut staged = Vec::new();
+                for (v, d) in moves {
+                    if v.starts_with('%') && v != d {
+                        let tmp = self.alloc_slot();
+                        self.emit(&format!("  mov {v}, {}", self.off(tmp)));
+                        staged.push((self.off(tmp), d));
+                    } else {
+                        staged.push((v, d));
+                    }
+                }
+                for (v, d) in staged {
+                    if v != d {
+                        self.emit(&format!("  mov {v}, {d}"));
+                    }
+                }
             }
         }
         if agg_ret {
@@ -6299,6 +6325,50 @@ fn reads_reg(line: &str, r: &str) -> bool {
     } else {
         reg_mentions(rest, r)
     }
+}
+
+/// Registers the code generator uses as scratch while evaluating an operand.
+/// A value in any other register is a promoted local's home, which operand
+/// evaluation never writes.
+const SCRATCH_REGS: [&str; 5] = ["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+
+/// The `mov`s that perform `moves` (source operand, destination register) as
+/// one parallel assignment. Each move is emitted once no other pending move
+/// still reads its destination (a source register, or the base or index of a
+/// memory source); a cycle (`%rdi` and `%rsi` swapped) parks one source in
+/// `%r11`, which is scratch and never an argument register. Done one by one in
+/// argument order, a source that was an earlier argument's destination was
+/// overwritten first, so every register-held argument went through a frame
+/// slot instead (`nqueens` stored and reloaded one per recursive call).
+fn parallel_moves(moves: Vec<(String, &str)>) -> Option<Vec<String>> {
+    let mut pending: Vec<(String, &str)> = moves.into_iter().filter(|(v, d)| v != d).collect();
+    let mut out = Vec::new();
+    while !pending.is_empty() {
+        let blocked = |k: usize, pending: &[(String, &str)]| {
+            pending.iter().enumerate().any(|(j, (v, _))| j != k && reg_mentions(v, pending[k].1))
+        };
+        if let Some(k) = (0..pending.len()).find(|&k| !blocked(k, &pending)) {
+            let (v, d) = pending.remove(k);
+            out.push(format!("  mov {v}, {d}"));
+            continue;
+        }
+        // Every destination is still read by another move: a cycle. Park a
+        // source that reads a pending destination in a scratch register no
+        // pending move reads, which unblocks that destination's move.
+        let reads_dest = |v: &str| pending.iter().any(|(_, d)| reg_mentions(v, d));
+        let k = pending.iter().position(|(v, _)| reads_dest(v))?;
+        let park = ["%r11", "%r10"]
+            .into_iter()
+            .find(|r| !pending.iter().any(|(v, _)| reg_mentions(v, r)))?;
+        let parked = pending[k].0.clone();
+        out.push(format!("  mov {parked}, {park}"));
+        for (v, _) in pending.iter_mut() {
+            if *v == parked {
+                *v = park.to_string();
+            }
+        }
+    }
+    Some(out)
 }
 
 fn reg_mentions(line: &str, r: &str) -> bool {
@@ -7754,6 +7824,47 @@ fn f(_1: &[i64; 8], _2: usize) -> i64 {
     }
 }
 ";
+
+    /// Run `moves` on a register file and return the argument registers.
+    fn run_moves(moves: &[(&str, &'static str)]) -> Vec<(String, i64)> {
+        let mut regs: HashMap<String, i64> = HashMap::new();
+        for (i, r) in ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9", "%rbx", "%r12", "%rax"].iter().enumerate() {
+            regs.insert(r.to_string(), 100 + i as i64);
+        }
+        // Memory at `8(%reg)` reads as the register's value plus 1000.
+        let read = |v: &str, regs: &HashMap<String, i64>| -> i64 {
+            if let Some(k) = v.strip_prefix('$') {
+                k.parse().unwrap()
+            } else if let Some(r) = v.strip_prefix("8(").and_then(|r| r.strip_suffix(')')) {
+                regs[r] + 1000
+            } else {
+                regs[v]
+            }
+        };
+        let want: Vec<(String, i64)> = moves.iter().map(|(v, d)| (d.to_string(), read(v, &regs))).collect();
+        let ms = parallel_moves(moves.iter().map(|(v, d)| (v.to_string(), *d)).collect()).expect("resolvable");
+        for m in &ms {
+            let (src, dst) = m.trim().strip_prefix("mov ").unwrap().rsplit_once(", ").unwrap();
+            let v = read(src, &regs);
+            regs.insert(dst.to_string(), v);
+        }
+        let got: Vec<(String, i64)> = want.iter().map(|(d, _)| (d.clone(), regs[d])).collect();
+        assert_eq!(got, want, "{ms:?}");
+        got
+    }
+
+    /// Argument moves are one parallel assignment: a swap, a rotation, a
+    /// memory source based on a register another argument overwrites, and
+    /// two independent cycles all land every value where it belongs.
+    #[test]
+    fn argument_moves_are_a_parallel_assignment() {
+        run_moves(&[("%rsi", "%rdi"), ("%rdi", "%rsi")]);
+        run_moves(&[("%rdx", "%rdi"), ("%rdi", "%rsi"), ("%rsi", "%rdx")]);
+        run_moves(&[("%r12", "%rdi"), ("8(%rdi)", "%rsi"), ("$7", "%rdx"), ("%rdi", "%rcx")]);
+        run_moves(&[("8(%rsi)", "%rdi"), ("%rdi", "%rsi")]);
+        run_moves(&[("%rsi", "%rdi"), ("%rdi", "%rsi"), ("%r9", "%r8"), ("%r8", "%r9"), ("$3", "%rdx")]);
+        run_moves(&[("%rbx", "%rdi"), ("%rbx", "%rsi"), ("%rax", "%rdx"), ("%rdi", "%rcx")]);
+    }
 
     /// The index of a store in a loop (`a[i & 7] = x`) is a register like the
     /// index of a load. Weighted by reads only, a store's index had no weight:
