@@ -45,6 +45,8 @@ const fn bit(r: u8) -> RegSet {
 /// which the runtime's internal helpers take arguments in.
 const CALL_USES: RegSet =
     bit(RDI) | bit(RSI) | bit(RDX) | bit(RCX) | bit(8) | bit(9) | bit(RAX) | bit(10) | bit(11);
+/// The integer argument registers, in order.
+const ARG_ORDER: [u8; 6] = [RDI, RSI, RDX, RCX, 8, 9];
 /// Registers a call may overwrite.
 const CALL_CLOBBERS: RegSet =
     bit(RAX) | bit(RCX) | bit(RDX) | bit(RSI) | bit(RDI) | bit(8) | bit(9) | bit(10) | bit(11);
@@ -327,7 +329,14 @@ fn base_mnem(m: &str) -> &str {
 
 /// Model one instruction, or `None` when it is not one this pass understands.
 fn parse_insn(line: &str) -> Option<Inst> {
-    let t = line.trim();
+    // `call f #argregs N`, as the MIR code generator writes every call: the
+    // call reads only its first N argument registers. Without the note a call
+    // is taken to read all of them (and `%rax`, `%r10`, `%r11`), which kept a
+    // dead copy into `%r8` or `%r9` alive before a one-argument call.
+    let (t, argregs) = match line.trim().split_once(" #argregs ") {
+        Some((code, n)) => (code.trim_end(), Some(n.trim().parse::<usize>().ok().filter(|n| *n <= 6)?)),
+        None => (line.trim(), None),
+    };
     let (mnem, rest) = match t.split_once(char::is_whitespace) {
         Some((m, r)) => (m, r.trim()),
         None => (t, ""),
@@ -377,11 +386,18 @@ fn parse_insn(line: &str) -> Option<Inst> {
             _ => return None,
         }
     }
+    if argregs.is_some() && b != "call" {
+        return None;
+    }
     if b == "call" {
+        let reads = match argregs {
+            Some(n) => ARG_ORDER[..n].iter().fold(0, |set, r| set | bit(*r)),
+            None => CALL_USES,
+        };
         i.is_call = true;
-        i.uses |= CALL_USES;
+        i.uses |= reads;
         i.writes = CALL_CLOBBERS;
-        i.implicit = CALL_USES | CALL_CLOBBERS;
+        i.implicit = reads | CALL_CLOBBERS;
         i.reads_mem = true;
         i.writes_mem = true;
         match i.ops.as_slice() {
@@ -1133,6 +1149,26 @@ fn run(mut f: Func, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_reads_only_the_argument_registers_it_names() {
+        // `%r8` is not an argument of a one-argument call, so the copy into it
+        // is dead; `%rdi` is, so its setup stays.
+        let body = "  mov %rbx, %r8\n  mov %r12, %rdi\n  call f #argregs 1\n  mov %rax, %rbx\n";
+        assert_eq!(optimize(body), "  mov %r12, %rdi\n  call f #argregs 1\n  mov %rax, %rbx\n");
+        // Without the note every argument register counts as read.
+        let plain = "  mov %rbx, %r8\n  mov %r12, %rdi\n  call f\n  mov %rax, %rbx\n";
+        assert_eq!(optimize(plain), plain);
+        // Five arguments: `%r8` is read.
+        let five = "  mov %rbx, %r8\n  mov %r12, %rdi\n  call f #argregs 5\n  mov %rax, %rbx\n";
+        assert_eq!(optimize(five), five);
+    }
+
+    #[test]
+    fn an_argument_note_on_anything_but_a_call_is_not_modelled() {
+        let body = "  mov %rbx, %r8 #argregs 1\n  ret\n";
+        assert_eq!(optimize(body), body);
+    }
 
     #[test]
     fn a_copy_is_read_through_and_then_dropped() {

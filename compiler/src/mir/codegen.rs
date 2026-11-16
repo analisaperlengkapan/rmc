@@ -5447,9 +5447,11 @@ impl<'a> FnGen<'a> {
             self.place_addr(dest)?;
             self.emit("  mov %rax, %rdi");
         }
+        // The note tells `asmopt` how many argument registers the call reads.
+        let n = reg_ops.len() + arg_shift;
         match &indirect {
-            Some(reg) => self.emit(&format!("  call *{reg}")),
-            None => self.emit(&format!("  call {}", asm_sym(&name))),
+            Some(reg) => self.emit(&format!("  call *{reg} #argregs {n}")),
+            None => self.emit(&format!("  call {} #argregs {n}", asm_sym(&name))),
         }
         self.restore_caller_saved(&caller_promos);
         if agg_ret {
