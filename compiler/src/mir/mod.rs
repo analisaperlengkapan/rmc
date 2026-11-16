@@ -7672,6 +7672,232 @@ fn whole_local(op: &Operand) -> Option<u32> {
         .map(|p| p.local)
 }
 
+/// The constants a block stores, by local, and where it goes next, when the
+/// block is nothing but stores of constants into distinct whole locals and a
+/// `goto`: one arm of a select. Each store becomes a few instructions on both
+/// paths, so an arm with more than `MAX_STORES` keeps its branch.
+fn const_arm(blk: &BasicBlock) -> Option<(BTreeMap<u32, i64>, u32)> {
+    const MAX_STORES: usize = 4;
+    let Terminator::Goto(j) = blk.term else { return None };
+    let mut stores = BTreeMap::new();
+    for st in &blk.stmts {
+        match st {
+            Stmt::Nop => {}
+            Stmt::Assign(p, Rvalue::Use(Operand::Const(k))) if p.proj.is_empty() => {
+                let v = match k {
+                    Const::Int(v) => *v,
+                    Const::Bool(b) => *b as i64,
+                    _ => return None,
+                };
+                if stores.insert(p.local, v).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    (!stores.is_empty() && stores.len() <= MAX_STORES).then_some((stores, j))
+}
+
+/// Whether evaluating `rv` early, on a path that did not evaluate it, is
+/// harmless: no trap (`/`, `%`), no memory access through a pointer or at a
+/// computed index (a bounds fact may hold only on the original path), no call.
+fn speculatable(rv: &Rvalue) -> bool {
+    let op_ok = |op: &Operand| match op {
+        Operand::Const(Const::Int(_) | Const::Bool(_)) => true,
+        Operand::Copy(p) | Operand::Move(p) => p.proj.iter().all(|pr| matches!(pr, Proj::Field(_))),
+        _ => false,
+    };
+    match rv {
+        Rvalue::Use(a) | Rvalue::Unary(UnOp::Not | UnOp::Neg, a) => op_ok(a),
+        Rvalue::Cast { op, kind: CastKind::IntToInt, .. } => op_ok(op),
+        Rvalue::Binary(op, a, b) => {
+            use BinOp::*;
+            matches!(op, Add | Sub | Mul | BitAnd | BitOr | BitXor | Shl | Shr | Eq | Ne | Lt | Le | Gt | Ge)
+                && op_ok(a)
+                && op_ok(b)
+        }
+        _ => false,
+    }
+}
+
+impl Function {
+    /// Fold a short-circuit condition chain that ends in a select into one
+    /// condition. `if s == 3 || (s == 2 && alive == 1) { 1 } else { 0 }` (the
+    /// rule in `life`) reaches MIR as three switches whose exits are the two
+    /// constant arms. A switch block `B` whose only predecessor `P` shares a
+    /// destination `D` with it is folded into `P`: `P` goes to `D` when
+    /// `goes(P, D) | goes(B, D)`, and to `B`'s other destination otherwise.
+    /// `B`'s own statements (at most four, all `speculatable`, defining
+    /// locals nothing outside `B` reads) move into `P`; a fold leaves three
+    /// (two conditions and their `|`), so a chain of three tests folds whole. Only chains whose two
+    /// destinations are constant arms meeting at one join are folded, so a
+    /// loop test or a branch around real work keeps its shape (and the
+    /// bounds facts later passes read off it); `select_diamonds` then turns
+    /// the single remaining switch into arithmetic.
+    fn fold_select_conditions(&mut self) -> bool {
+        let mut changed = false;
+        // Each fold removes one switch, so this terminates.
+        loop {
+            let n = self.blocks.len();
+            let mut preds = vec![0u32; n];
+            for blk in &self.blocks {
+                for s in successors(&blk.term) {
+                    preds[s as usize] += 1;
+                }
+            }
+            let switch2 = |b: usize| match &self.blocks[b].term {
+                Terminator::SwitchInt { discr, targets, otherwise } if targets.len() == 1 => {
+                    let d = whole_local(discr)?;
+                    let ty = &self.locals[d as usize].ty;
+                    let (v, t) = targets[0];
+                    let ok = match **ty {
+                        Ty::Bool => v == 0 || v == 1,
+                        _ => ty.int_width_sign().is_some(),
+                    };
+                    (ok && t != *otherwise).then_some((d, v, t, *otherwise))
+                }
+                _ => None,
+            };
+            let mut found = None;
+            'search: for p in 0..n {
+                let Some((_, _, pt, po)) = switch2(p) else { continue };
+                for (b, dd) in [(pt, po), (po, pt)] {
+                    let bu = b as usize;
+                    if bu == p || preds[bu] != 1 {
+                        continue;
+                    }
+                    let Some((_, _, bt, bo)) = switch2(bu) else { continue };
+                    let e = if bt == dd {
+                        bo
+                    } else if bo == dd {
+                        bt
+                    } else {
+                        continue;
+                    };
+                    if [dd, e].iter().any(|&x| x == b || x as usize == p) {
+                        continue;
+                    }
+                    let (Some((sd, jd)), Some((se, je))) =
+                        (const_arm(&self.blocks[dd as usize]), const_arm(&self.blocks[e as usize]))
+                    else {
+                        continue;
+                    };
+                    if jd != je || sd.keys().ne(se.keys()) {
+                        continue;
+                    }
+                    // `B`'s statements run on every path through `P` now.
+                    let body: Vec<&Stmt> =
+                        self.blocks[bu].stmts.iter().filter(|s| !matches!(s, Stmt::Nop)).collect();
+                    if body.len() > 4 {
+                        continue;
+                    }
+                    let mut written = HashSet::new();
+                    for st in &body {
+                        let Stmt::Assign(dst, rv) = st else { continue };
+                        if !dst.proj.is_empty() || !speculatable(rv) {
+                            continue 'search;
+                        }
+                        written.insert(dst.local);
+                    }
+                    if !written.is_empty() && self.read_outside(bu, &written) {
+                        continue;
+                    }
+                    found = Some((p, bu, dd, e));
+                    break 'search;
+                }
+            }
+            let Some((p, b, dd, e)) = found else { break };
+            let goes_p = self.goes_to(p, dd);
+            let goes_b = self.goes_to(b, dd);
+            let mut stmts = std::mem::take(&mut self.blocks[b].stmts);
+            self.blocks[b].term = Terminator::Unreachable;
+            // A `move` in `B` said its source was dead on `B`'s path; on
+            // `P`'s other path it may not be.
+            for st in &mut stmts {
+                if let Stmt::Assign(_, rv) = st {
+                    map_rv_operands(rv, &|o| {
+                        if let Operand::Move(p) = o {
+                            *o = Operand::Copy(p.clone());
+                        }
+                    });
+                }
+            }
+            let cond = |g: Result<Operand, Rvalue>, stmts: &mut Vec<Stmt>, locals: &mut Vec<LocalDecl>| match g {
+                Ok(op) => op,
+                Err(rv) => {
+                    let l = locals.len() as u32;
+                    locals.push(LocalDecl { ty: Box::new(Ty::Bool), is_arg: false, name: None });
+                    let pl = Place { local: l, proj: Vec::new() };
+                    stmts.push(Stmt::Assign(pl.clone(), rv));
+                    Operand::Copy(pl)
+                }
+            };
+            let gp = cond(goes_p, &mut stmts, &mut self.locals);
+            let gb = cond(goes_b, &mut stmts, &mut self.locals);
+            let g = cond(Err(Rvalue::Binary(BinOp::BitOr, gp, gb)), &mut stmts, &mut self.locals);
+            self.blocks[p].stmts.extend(stmts);
+            self.blocks[p].term = Terminator::SwitchInt { discr: g, targets: vec![(0, e)], otherwise: dd };
+            changed = true;
+        }
+        changed
+    }
+
+    /// Whether any statement or terminator outside block `skip` reads one of
+    /// `locals`.
+    fn read_outside(&self, skip: usize, locals: &HashSet<u32>) -> bool {
+        self.blocks.iter().enumerate().any(|(i, blk)| {
+            if i == skip {
+                return false;
+            }
+            let mut seen = HashSet::new();
+            for st in &blk.stmts {
+                if let Stmt::Assign(dst, rv) = st {
+                    rvalue_mentions(rv, &mut seen);
+                    // A destination's projections read their index locals
+                    // (and the base, for a partial write).
+                    if !dst.proj.is_empty() {
+                        place_mentions(dst, &mut seen);
+                    }
+                }
+            }
+            term_mentions(&blk.term, &mut seen);
+            seen.iter().any(|l| locals.contains(l))
+        })
+    }
+
+    /// The `bool` condition under which switch block `b` (a two-way switch)
+    /// goes to `dest`: an operand when it is the discriminant itself, else the
+    /// rvalue that computes it.
+    fn goes_to(&self, b: usize, dest: u32) -> Result<Operand, Rvalue> {
+        let Terminator::SwitchInt { discr, targets, .. } = &self.blocks[b].term else {
+            unreachable!("goes_to on a switch")
+        };
+        let (v, t) = targets[0];
+        // On `dest == t` the switch goes there when `d == v`.
+        let on_equal = dest == t;
+        let d = Operand::Copy(operand_place(discr).expect("whole local").clone());
+        if matches!(self.operand_ty_of(discr), Ty::Bool) {
+            // `d == 1` and `d != 0` are `d`; the other two are `!d`.
+            if on_equal == (v == 1) {
+                Ok(d)
+            } else {
+                Err(Rvalue::Unary(UnOp::Not, d))
+            }
+        } else {
+            let op = if on_equal { BinOp::Eq } else { BinOp::Ne };
+            Err(Rvalue::Binary(op, d, Operand::Const(Const::Int(v))))
+        }
+    }
+
+    fn operand_ty_of(&self, op: &Operand) -> Ty {
+        match whole_local(op) {
+            Some(l) => (*self.locals[l as usize].ty).clone(),
+            None => Ty::Other,
+        }
+    }
+}
+
 /// Turn a diamond that only picks one of two constants into straight-line
 /// arithmetic.
 ///
@@ -7688,7 +7914,8 @@ fn whole_local(op: &Operand) -> Option<u32> {
 /// effect.
 pub fn select_diamonds(prog: &mut Program) {
     for f in &mut prog.funcs {
-        if f.select_diamonds() {
+        let folded = f.fold_select_conditions();
+        if f.select_diamonds() || folded {
             f.prune_unreachable();
             f.merge_blocks();
         }
@@ -7704,33 +7931,7 @@ impl Function {
                 preds[s as usize] += 1;
             }
         }
-        // The constants an arm stores, by local, and where it goes next, when
-        // the arm is nothing but stores of constants into distinct whole
-        // locals. Each store becomes a few instructions on both paths, so an
-        // arm with more than `MAX_STORES` keeps its branch.
-        const MAX_STORES: usize = 4;
-        let arm = |b: u32| -> Option<(BTreeMap<u32, i64>, u32)> {
-            let blk = &self.blocks[b as usize];
-            let Terminator::Goto(j) = blk.term else { return None };
-            let mut stores = BTreeMap::new();
-            for st in &blk.stmts {
-                match st {
-                    Stmt::Nop => {}
-                    Stmt::Assign(p, Rvalue::Use(Operand::Const(k))) if p.proj.is_empty() => {
-                        let v = match k {
-                            Const::Int(v) => *v,
-                            Const::Bool(b) => *b as i64,
-                            _ => return None,
-                        };
-                        if stores.insert(p.local, v).is_some() {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            (!stores.is_empty() && stores.len() <= MAX_STORES).then_some((stores, j))
-        };
+        let arm = |b: u32| const_arm(&self.blocks[b as usize]);
         let mut rewrites = Vec::new();
         // Locals the rewrites add, numbered from the current end.
         let mut fresh: Vec<Ty> = Vec::new();
@@ -9309,6 +9510,80 @@ fn main(_1: {discr_ty}) -> i64 {{
         let f = &prog.funcs[0];
         assert_eq!(f.blocks.len(), 4);
         assert!(matches!(f.blocks[0].term, Terminator::SwitchInt { .. }));
+    }
+
+    /// `life`'s rule as rustc prints it: `s == 3 || (s == 2 && alive == 1)`
+    /// as three integer switches into two constant arms.
+    fn chain_fixture(arm_one: &str) -> String {
+        format!("\
+fn main(_1: i64, _2: i64) -> i64 {{
+    let mut _0: i64;
+    let mut _3: i64;
+
+    bb0: {{
+        switchInt(copy _1) -> [3: bb3, otherwise: bb1];
+    }}
+
+    bb1: {{
+        switchInt(copy _1) -> [2: bb2, otherwise: bb4];
+    }}
+
+    bb2: {{
+        switchInt(copy _2) -> [1: bb3, otherwise: bb4];
+    }}
+
+    bb3: {{
+        {arm_one}
+        goto -> bb5;
+    }}
+
+    bb4: {{
+        _3 = const 0_i64;
+        goto -> bb5;
+    }}
+
+    bb5: {{
+        _0 = copy _3;
+        return;
+    }}
+}}
+")
+    }
+
+    #[test]
+    fn a_condition_chain_into_a_select_folds_to_straight_line_code() {
+        let mut prog = parse(&chain_fixture("_3 = const 1_i64;")).expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        assert_eq!(f.blocks.len(), 1, "{:?}", f.blocks);
+        let rvs = rvalues(f);
+        assert_eq!(rvs.iter().filter(|r| r.contains("BitOr")).count(), 2, "{rvs:?}");
+        assert!(rvs.iter().any(|r| r.contains("Binary(Eq") && r.contains("Int(3)")), "{rvs:?}");
+    }
+
+    #[test]
+    fn a_condition_chain_around_real_work_keeps_its_branches() {
+        // The `then` arm reads a local: not a select, so nothing folds and the
+        // three tests stay (a later pass may read bounds off them).
+        let mut prog = parse(&chain_fixture("_3 = copy _2;")).expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
+        assert_eq!(switches, 3);
+    }
+
+    #[test]
+    fn only_trap_free_register_arithmetic_is_speculated() {
+        let local = |l: u32, proj: Vec<Proj>| Operand::Copy(Place { local: l, proj });
+        let lt = |a: Operand| Rvalue::Binary(BinOp::Lt, a, Operand::Const(Const::Int(3)));
+        assert!(speculatable(&lt(local(1, vec![]))));
+        assert!(speculatable(&lt(local(1, vec![Proj::Field(0)]))));
+        // A read through a pointer or at a computed index may fault where the
+        // guard it was behind is false; a division may divide by zero.
+        assert!(!speculatable(&lt(local(1, vec![Proj::Deref]))));
+        assert!(!speculatable(&lt(local(1, vec![Proj::IndexLocal(2)]))));
+        assert!(!speculatable(&Rvalue::Binary(BinOp::Div, local(1, vec![]), local(2, vec![]))));
+        assert!(!speculatable(&Rvalue::Binary(BinOp::Rem, local(1, vec![]), local(2, vec![]))));
     }
 
     #[test]

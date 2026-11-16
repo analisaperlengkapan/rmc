@@ -74,6 +74,26 @@ fn stream(seed: i64, n: i64) -> i64 {
     t
 }
 
+// A short-circuit chain ending in a select (`life`'s rule) folds into one
+// condition, then into arithmetic. Every comparison kind and both `&&` and
+// `||`, on integer and `bool` discriminants.
+#[inline(never)]
+fn chains(k: i64, m: i64) -> i64 {
+    let mut t = 0;
+    let mut s = k - 6;
+    while s < k + 6 {
+        let alive = (s ^ m) & 1;
+        let next: i64 = if s == 3 || (s == 2 && alive == 1) { 1 } else { 0 };
+        let both: i64 = if s > m && alive != 0 { 9 } else { -4 };
+        let either: u8 = if s < 0 || m < s { 2 } else { 250 };
+        let flag = s >= m;
+        let mixed: bool = if flag && !(alive == 0) { true } else { false };
+        t = t * 7 + next * 1000 + both * 100 + either as i64 * 10 + mixed as i64;
+        s += 1;
+    }
+    t
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
@@ -84,5 +104,7 @@ pub extern "C" fn main() -> i64 {
     out(narrow(k));
     out(flags(k));
     out(stream(k, 1000));
+    out(chains(k, 1));
+    out(chains(k, -k));
     0
 }
