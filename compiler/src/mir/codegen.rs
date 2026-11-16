@@ -1486,8 +1486,15 @@ impl<'a> FnGen<'a> {
             let mut local_counts: HashMap<u32, u32> = HashMap::new();
             for s in &b.stmts {
                 if let Stmt::Assign(p, rv) = s {
+                    // A written place reads its index locals and, behind a
+                    // leading `Deref`, its base pointer, exactly as a read of
+                    // the place does. Counted only as `projected`, the index
+                    // of every store (`a[i] = x`) had no weight and stayed in
+                    // the frame, stored and reloaded on each iteration
+                    // (`life`), and a pointer written through never got a
+                    // register.
                     if !p.proj.is_empty() {
-                        projected.insert(p.local);
+                        scan_operand(&Operand::Copy(p.clone()), &mut local_counts, &mut projected, &mut index_locals);
                     }
                     scan_rv(rv, &mut local_counts, &mut projected, &mut addr_taken, &mut index_locals);
                 }
@@ -7747,6 +7754,55 @@ fn f(_1: &[i64; 8], _2: usize) -> i64 {
     }
 }
 ";
+
+    /// The index of a store in a loop (`a[i & 7] = x`) is a register like the
+    /// index of a load. Weighted by reads only, a store's index had no weight:
+    /// it was written to a frame slot and reloaded into `%rcx` for every
+    /// store (`life`'s inner loop).
+    #[test]
+    fn a_store_index_in_a_loop_takes_a_register() {
+        let f = asm_of(
+            "\
+fn f(_1: &[i64; 8], _2: i64) -> i64 {
+    let mut _0: i64;
+    let mut _3: [i64; 8];
+    let mut _4: usize;
+    let mut _5: i64;
+    let mut _6: bool;
+    let mut _7: usize;
+
+    bb0: {
+        _3 = [const 0_i64; 8];
+        _5 = const 0_i64;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _4 = copy _5 as usize (IntToInt);
+        _7 = BitAnd(copy _4, const 7_usize);
+        _3[_7] = copy _2;
+        _5 = Add(copy _5, const 1_i64);
+        _6 = Lt(copy _5, const 100_i64);
+        switchInt(move _6) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb2: {
+        _0 = copy _3[_4];
+        return;
+    }
+}
+",
+            "f",
+        );
+        let store = f
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("mov %") && l.contains("(%rbp,%") && l.ends_with(",8)"))
+            .unwrap_or_else(|| panic!("no indexed store:\n{f}"));
+        assert!(!store.contains("%rcx,8)"), "index reloaded into a scratch register:\n{f}");
+        let reload = f.lines().map(str::trim).any(|l| l.starts_with("mov -") && l.ends_with("(%rbp), %rcx"));
+        assert!(!reload, "index reloaded from the frame:\n{f}");
+    }
 
     /// A shift by a constant is an immediate, not a count loaded into `%cl`
     /// (which also cost a frame slot to park the shifted value).
