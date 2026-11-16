@@ -7898,6 +7898,244 @@ impl Function {
     }
 }
 
+/// Fold a two-sided range test into one unsigned comparison.
+///
+/// `c >= b'0' && c <= b'9'` reaches MIR as two switches on comparisons of the
+/// same local against constants, both failing to the same block: two compares
+/// and two branches per character in `textparse`'s parse loop. When the values
+/// that pass both tests are one bounded interval `[lo, hi]`, the pair is
+/// `(x as u64).wrapping_sub(lo) <= hi - lo`, one compare and one branch (a
+/// value below `lo` wraps to a huge one). Exact for any integer type: the cast
+/// to `u64` keeps every value distinct, sign-extending a signed one.
+///
+/// It runs after `drop_redundant_asserts`, which reads index bounds off the
+/// original tests (`i >= 0 && i < LEN` guards `a[i]`).
+pub fn fold_range_checks(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        if f.fold_range_checks() {
+            f.prune_unreachable();
+            f.merge_blocks();
+        }
+    }
+}
+
+/// The values of `x` for which `x op k` (or `k op x` when `swapped`) holds,
+/// as an inclusive interval with open ends as `None`.
+fn compare_interval(op: BinOp, k: i128, swapped: bool) -> Option<(Option<i128>, Option<i128>)> {
+    use BinOp::*;
+    let op = if swapped {
+        match op {
+            Lt => Gt,
+            Le => Ge,
+            Gt => Lt,
+            Ge => Le,
+            o => o,
+        }
+    } else {
+        op
+    };
+    Some(match op {
+        Lt => (None, Some(k - 1)),
+        Le => (None, Some(k)),
+        Gt => (Some(k + 1), None),
+        Ge => (Some(k), None),
+        Eq => (Some(k), Some(k)),
+        _ => return None,
+    })
+}
+
+/// The complement of a half-open interval, itself half-open.
+fn complement_half(iv: (Option<i128>, Option<i128>)) -> Option<(Option<i128>, Option<i128>)> {
+    match iv {
+        (None, Some(h)) => Some((Some(h + 1), None)),
+        (Some(l), None) => Some((None, Some(l - 1))),
+        _ => None,
+    }
+}
+
+impl Function {
+    fn fold_range_checks(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let n = self.blocks.len();
+            let mut preds = vec![0u32; n];
+            for blk in &self.blocks {
+                for s in successors(&blk.term) {
+                    preds[s as usize] += 1;
+                }
+            }
+            // A block's test: the compared local, the interval of its values
+            // that go to `t` (the switch's `otherwise` or its target), the
+            // other target, and the statement index of the comparison.
+            // Each way to read a block's test as "pass to one target exactly
+            // when `x` is in an interval, else fail to the other": the
+            // compared local, the interval, the pass and fail targets, and
+            // the statement index of the comparison.
+            type Reading = (u32, (Option<i128>, Option<i128>), u32, u32, usize);
+            let tests = |b: usize| -> Option<Vec<Reading>> {
+                let Terminator::SwitchInt { discr, targets, otherwise } = &self.blocks[b].term else {
+                    return None;
+                };
+                let c = whole_local(discr)?;
+                if targets.len() != 1 || !matches!(*self.locals[c as usize].ty, Ty::Bool) {
+                    return None;
+                }
+                let (si, rv) = self.blocks[b].stmts.iter().enumerate().rev().find_map(|(i, st)| match st {
+                    Stmt::Assign(d, rv) if d.local == c && d.proj.is_empty() => Some((i, rv)),
+                    _ => None,
+                })?;
+                let Rvalue::Binary(op, a, k) = rv else { return None };
+                let (x, k, swapped) = match (whole_local(a), whole_local(k), a, k) {
+                    (Some(x), None, _, Operand::Const(Const::Int(k))) => (x, *k, false),
+                    (None, Some(x), Operand::Const(Const::Int(k)), _) => (x, *k, true),
+                    _ => return None,
+                };
+                let ty = self.locals[x as usize].ty.int_width_sign()?;
+                let k = if ty.1 { k as i128 } else { k as u64 as i128 };
+                let holds = compare_interval(*op, k, swapped)?;
+                // `[0: a, otherwise: b]` goes to `b` when the comparison holds;
+                // `[1: a, otherwise: b]` goes to `a`.
+                let (when_true, when_false) = match targets[0] {
+                    (0, a) => (*otherwise, a),
+                    (1, a) => (a, *otherwise),
+                    _ => return None,
+                };
+                let mut out = vec![(x, holds, when_true, when_false, si)];
+                if let Some(not) = complement_half(holds) {
+                    out.push((x, not, when_false, when_true, si));
+                }
+                Some(out)
+            };
+            let test = |b: usize| -> Vec<Reading> { tests(b).unwrap_or_default() };
+            let mut found = None;
+            'search: for (p, (x, ip, bp, fp, sp)) in (0..n).flat_map(|p| test(p).into_iter().map(move |r| (p, r))) {
+                let b = bp as usize;
+                if b == p || preds[b] != 1 {
+                    continue;
+                }
+                // `B` holds nothing but its own comparison.
+                if self.blocks[b].stmts.iter().filter(|s| !matches!(s, Stmt::Nop)).count() != 1 {
+                    continue;
+                }
+                let Some((_, ib, tb, _, _)) =
+                    test(b).into_iter().find(|&(xb, _, tb, fb, _)| xb == x && fb == fp && tb != fp)
+                else {
+                    continue;
+                };
+                let lo = match (ip.0, ib.0) {
+                    (Some(a), Some(c)) => a.max(c),
+                    (a, c) => a.or(c).unwrap_or(i128::MIN),
+                };
+                let hi = match (ip.1, ib.1) {
+                    (Some(a), Some(c)) => a.min(c),
+                    (a, c) => a.or(c).unwrap_or(i128::MAX),
+                };
+                // Both ends bounded (otherwise it is one comparison already),
+                // and a span a 32-bit immediate holds.
+                if lo == i128::MIN || hi == i128::MAX || lo > hi || hi - lo > i32::MAX as i128 {
+                    continue;
+                }
+                // The comparisons' results feed only their switches.
+                let cp = match &self.blocks[p].term {
+                    Terminator::SwitchInt { discr, .. } => whole_local(discr),
+                    _ => None,
+                };
+                let cb = match &self.blocks[b].term {
+                    Terminator::SwitchInt { discr, .. } => whole_local(discr),
+                    _ => None,
+                };
+                let (Some(cp), Some(cb)) = (cp, cb) else { continue };
+                let mine: HashSet<u32> = [cp, cb].into_iter().collect();
+                if self.read_outside_except(&[p, b], &mine) {
+                    continue;
+                }
+                // Within `P`, nothing after the comparison reads its result
+                // (its definition is dropped) or writes `x` (read at the end).
+                let tail_conflicts = self.blocks[p].stmts[sp + 1..].iter().any(|st| match st {
+                    Stmt::Assign(d, rv) => {
+                        let mut r = HashSet::new();
+                        rvalue_mentions(rv, &mut r);
+                        if !d.proj.is_empty() {
+                            place_mentions(d, &mut r);
+                        }
+                        r.contains(&cp) || d.local == x
+                    }
+                    Stmt::Nop => false,
+                });
+                if tail_conflicts {
+                    continue;
+                }
+                found = Some((p, b, x, sp, lo, hi, tb, fp));
+                break 'search;
+            }
+            let Some((p, b, x, sp, lo, hi, t, f)) = found else { break };
+            let u64t = Ty::Int { width: 8, signed: false };
+            let fresh = |ty: Ty, locals: &mut Vec<LocalDecl>| {
+                locals.push(LocalDecl { ty: Box::new(ty), is_arg: false, name: None });
+                Place { local: (locals.len() - 1) as u32, proj: Vec::new() }
+            };
+            let w = fresh(u64t.clone(), &mut self.locals);
+            let inr = fresh(Ty::Bool, &mut self.locals);
+            let xty = (*self.locals[x as usize].ty).clone();
+            let mut stmts = vec![Stmt::Assign(
+                w.clone(),
+                Rvalue::Cast {
+                    from: Box::new(xty),
+                    to: Box::new(u64t),
+                    op: Operand::Copy(Place { local: x, proj: Vec::new() }),
+                    kind: CastKind::IntToInt,
+                },
+            )];
+            if lo != 0 {
+                stmts.push(Stmt::Assign(
+                    w.clone(),
+                    Rvalue::Binary(BinOp::Sub, Operand::Copy(w.clone()), Operand::Const(Const::Int(lo as i64))),
+                ));
+            }
+            stmts.push(Stmt::Assign(
+                inr.clone(),
+                Rvalue::Binary(BinOp::Le, Operand::Copy(w), Operand::Const(Const::Int((hi - lo) as i64))),
+            ));
+            // `P`'s own comparison is now unused.
+            self.blocks[p].stmts[sp] = Stmt::Nop;
+            self.blocks[p].stmts.extend(stmts);
+            self.blocks[p].term =
+                Terminator::SwitchInt { discr: Operand::Copy(inr), targets: vec![(0, f)], otherwise: t };
+            self.blocks[b].stmts.clear();
+            self.blocks[b].term = Terminator::Unreachable;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Whether a block other than those in `skip` reads one of `locals`.
+    fn read_outside_except(&self, skip: &[usize], locals: &HashSet<u32>) -> bool {
+        (0..self.blocks.len())
+            .filter(|i| !skip.contains(i))
+            .any(|i| {
+                let mut one = self.block_reads(i);
+                one.retain(|l| locals.contains(l));
+                !one.is_empty()
+            })
+    }
+
+    /// Every local block `i` reads.
+    fn block_reads(&self, i: usize) -> HashSet<u32> {
+        let blk = &self.blocks[i];
+        let mut seen = HashSet::new();
+        for st in &blk.stmts {
+            if let Stmt::Assign(dst, rv) = st {
+                rvalue_mentions(rv, &mut seen);
+                if !dst.proj.is_empty() {
+                    place_mentions(dst, &mut seen);
+                }
+            }
+        }
+        term_mentions(&blk.term, &mut seen);
+        seen
+    }
+}
+
 /// Turn a diamond that only picks one of two constants into straight-line
 /// arithmetic.
 ///
@@ -9584,6 +9822,79 @@ fn main(_1: i64, _2: i64) -> i64 {{
         assert!(!speculatable(&lt(local(1, vec![Proj::IndexLocal(2)]))));
         assert!(!speculatable(&Rvalue::Binary(BinOp::Div, local(1, vec![]), local(2, vec![]))));
         assert!(!speculatable(&Rvalue::Binary(BinOp::Rem, local(1, vec![]), local(2, vec![]))));
+    }
+
+    /// `c >= 48 && c <= 57` on a `u8`, as rustc prints it.
+    fn range_fixture(second: &str) -> String {
+        format!("\
+fn main(_1: u8) -> i64 {{
+    let mut _0: i64;
+    let mut _2: bool;
+    let mut _3: bool;
+
+    bb0: {{
+        _2 = Ge(copy _1, const 48_u8);
+        switchInt(move _2) -> [0: bb3, otherwise: bb1];
+    }}
+
+    bb1: {{
+        _3 = {second};
+        switchInt(move _3) -> [0: bb3, otherwise: bb2];
+    }}
+
+    bb2: {{
+        _0 = const 1_i64;
+        return;
+    }}
+
+    bb3: {{
+        _0 = const 0_i64;
+        return;
+    }}
+}}
+")
+    }
+
+    #[test]
+    fn a_two_sided_range_test_is_one_unsigned_compare() {
+        let mut prog = parse(&range_fixture("Le(copy _1, const 57_u8)")).expect("fixture parses");
+        fold_range_checks(&mut prog);
+        let f = &prog.funcs[0];
+        let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
+        assert_eq!(switches, 1, "{:?}", f.blocks);
+        let rvs = rvalues(f);
+        assert!(rvs.iter().any(|r| r.contains("Sub") && r.contains("Int(48)")), "{rvs:?}");
+        assert!(rvs.iter().any(|r| r.contains("Le") && r.contains("Int(9)")), "{rvs:?}");
+        // The fold's own comparison is the only one left.
+        assert!(!rvs.iter().any(|r| r.contains("Ge(")), "{rvs:?}");
+    }
+
+    #[test]
+    fn a_range_test_switching_on_one_reads_its_arms_the_right_way() {
+        // `[1: bb1, otherwise: bb3]`: `c >= 48` goes on to the second test
+        // when it holds. Reading the `1` arm as the complement made the pair
+        // look unbounded below, and the fold was missed (or, with a bounded
+        // complement, would have tested the wrong interval).
+        let text = range_fixture("Le(copy _1, const 57_u8)")
+            .replace("switchInt(move _2) -> [0: bb3, otherwise: bb1];", "switchInt(move _2) -> [1: bb1, otherwise: bb3];");
+        let mut prog = parse(&text).expect("fixture parses");
+        fold_range_checks(&mut prog);
+        let f = &prog.funcs[0];
+        let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
+        assert_eq!(switches, 1, "{:?}", f.blocks);
+        let rvs = rvalues(f);
+        assert!(rvs.iter().any(|r| r.contains("Sub") && r.contains("Int(48)")), "{rvs:?}");
+        assert!(rvs.iter().any(|r| r.contains("Le") && r.contains("Int(9)")), "{rvs:?}");
+    }
+
+    #[test]
+    fn a_test_that_is_not_an_interval_keeps_both_compares() {
+        // `c >= 48 && c != 57` passes two intervals, not one.
+        let mut prog = parse(&range_fixture("Ne(copy _1, const 57_u8)")).expect("fixture parses");
+        fold_range_checks(&mut prog);
+        let f = &prog.funcs[0];
+        let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
+        assert_eq!(switches, 2);
     }
 
     #[test]
