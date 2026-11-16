@@ -1513,16 +1513,64 @@ impl<'a> FnGen<'a> {
         for (v, w) in self.const_candidates(&freq) {
             cands.push((w, 1u8, v, Cand::Const(v)));
         }
-        // Hottest first; at equal weight a local before a constant (it can
-        // share its register), then by number so the order is deterministic.
-        cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        // Every local before any constant, each group hottest first (then by
+        // number, so the order is deterministic). A local shares its register
+        // with whatever it never overlaps; a constant holds one for the whole
+        // function, so a constant used in one loop would take a register from
+        // every other loop's values. It gets what the locals leave: inline, a
+        // constant costs one `movabs` per use, while a loop value in the frame
+        // costs a load and a store on a dependency chain.
+        cands.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)).then(a.2.cmp(&b.2)));
         let crossers = self.call_crossers();
-        for (_, _, _, c) in cands {
+        // `RMC_TRACE_ALLOC=1`: every candidate in priority order and where it
+        // went, to see why a hot value is in the frame.
+        let trace = std::env::var_os("RMC_TRACE_ALLOC").is_some();
+        if trace {
+            eprintln!("--- alloc: {}", self.func.name);
+        }
+        for (w, _, _, c) in cands {
             match c {
                 Cand::Local(l) => {
-                    self.promote_shared(l, crossers.contains(&l), in_loop.contains(&l));
+                    let got = self.promote_shared(l, crossers.contains(&l), in_loop.contains(&l));
+                    if trace && !got {
+                        // Which owner of each register it overlaps.
+                        let empty = HashSet::new();
+                        let mine = self.interf.get(&l).unwrap_or(&empty);
+                        let mut why = String::new();
+                        for r in PROMOTE_REGS.iter().chain(CALLER_REGS.iter()) {
+                            let owners = self.reg_owners.get(r).cloned().unwrap_or_default();
+                            let hit: Vec<String> = owners
+                                .iter()
+                                .filter(|o| mine.contains(o) || self.no_share.contains(o))
+                                .map(|o| format!("_{o}"))
+                                .collect();
+                            let c = self.const_regs.values().chain(self.const_caller_regs.values()).any(|x| x == r);
+                            why.push_str(&format!(" {r}:{}{}", hit.join("/"), if c { "const" } else { "" }));
+                        }
+                        eprintln!("        blocked by{why}");
+                    }
+                    if trace {
+                        let home = if got { self.promo[&l].reg } else { "frame" };
+                        let name = self.func.locals[l as usize].name.clone().unwrap_or_default();
+                        eprintln!(
+                            "  _{l:<4} w={w:<8} {home:6} crosses_call={} loop={} {name}",
+                            crossers.contains(&l),
+                            in_loop.contains(&l)
+                        );
+                    }
                 }
-                Cand::Const(v) => self.hoist_const(v),
+                Cand::Const(v) => {
+                    self.hoist_const(v);
+                    if trace {
+                        let home = self
+                            .const_regs
+                            .get(&v)
+                            .or_else(|| self.const_caller_regs.get(&v))
+                            .copied()
+                            .unwrap_or("inline");
+                        eprintln!("  const {v} w={w} {home}");
+                    }
+                }
             }
         }
     }
@@ -1594,24 +1642,7 @@ impl<'a> FnGen<'a> {
             .iter()
             .map(|b| successors(&b.term).into_iter().filter(|s| (*s as usize) < n).collect())
             .collect();
-        let reach = block_reachability(&succ);
-        let mut depths = vec![0u32; n];
-        for (latch, s) in succ.iter().enumerate() {
-            for &header in s {
-                let h = header as usize;
-                if h == latch || !reach[h][latch] {
-                    continue;
-                }
-                // The natural loop of `h`: every block `x` with
-                // `h` reaches `x` and `x` reaches `latch` (plus the header).
-                for x in 0..n {
-                    if x == h || (reach[h][x] && reach[x][latch]) {
-                        depths[x] += 1;
-                    }
-                }
-            }
-        }
-        depths
+        loop_depths_of(&succ)
     }
 
     /// The loop-body entry block of each natural loop, to pin to a 16-byte
@@ -1791,10 +1822,37 @@ impl<'a> FnGen<'a> {
             let mut tu: HashSet<u32> = HashSet::new();
             scan_term_uses(&b.term, &mut tu);
             term_extra_reads(&b.term, &mut tu);
-            if matches!(b.term, Terminator::SwitchInt { .. } | Terminator::Assert { .. }) {
+            // A comparison folded into the branch is evaluated at the
+            // terminator, from its operands, so they are read there: those of
+            // the statement that computes the condition, and, when that is the
+            // `and` of an overflow check, those of the two comparisons it
+            // joins. (Not every binary statement in the block: that kept every
+            // operand of an unrelated `a - b` alive to the end of a loop's
+            // entry block, across the loop's own initialisers.)
+            let cond = match &b.term {
+                Terminator::SwitchInt { discr, .. } => operand_place(discr),
+                Terminator::Assert { cond, .. } => operand_place(cond),
+                _ => None,
+            };
+            if let Some(c) = cond.filter(|p| p.proj.is_empty()) {
+                let mut conds: HashSet<u32> = HashSet::new();
+                conds.insert(c.local);
                 for st in &b.stmts {
-                    if let Stmt::Assign(_, rv @ Rvalue::Binary(..)) = st {
-                        scan_rv_uses(rv, &mut tu);
+                    if let Stmt::Assign(d, Rvalue::Binary(BinOp::BitAnd | BinOp::BitOr, x, y)) = st {
+                        if d.proj.is_empty() && d.local == c.local {
+                            for o in [x, y] {
+                                if let Some(q) = operand_place(o).filter(|q| q.proj.is_empty()) {
+                                    conds.insert(q.local);
+                                }
+                            }
+                        }
+                    }
+                }
+                for st in &b.stmts {
+                    if let Stmt::Assign(d, rv @ Rvalue::Binary(..)) = st {
+                        if d.proj.is_empty() && conds.contains(&d.local) {
+                            scan_rv_uses(rv, &mut tu);
+                        }
                     }
                 }
             }
@@ -7144,6 +7202,84 @@ fn is_compare(op: BinOp) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
 
+/// The loop-nesting depth of each block of a control-flow graph given as
+/// successor lists, block 0 the entry (see `FnGen::loop_depths`).
+fn loop_depths_of(succ: &[Vec<u32>]) -> Vec<u32> {
+    let n = succ.len();
+    // A back edge is an edge to a block still on the depth-first stack, so
+    // it closes a cycle through that block. (Index order is not enough: an
+    // out-of-line `then` block jumping back to its join looks backwards
+    // too. Dominance is not enough either: `stats`'s loop is entered at
+    // two places.) Each header is one loop however many back edges reach
+    // it. Counting every edge on a cycle as a loop, as this once did, gave
+    // a block a depth of roughly the number of blocks in its loop body,
+    // and with weights of 8^depth every loop of five blocks or more looked
+    // equally hot, so an outer loop's values outranked an inner loop's.
+    let mut latches: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut state = vec![0u8; n]; // 0 unseen, 1 on the stack, 2 done
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    if n > 0 {
+        state[0] = 1;
+        stack.push((0, 0));
+    }
+    while let Some(&mut (u, ref mut next)) = stack.last_mut() {
+        if *next < succ[u].len() {
+            let v = succ[u][*next] as usize;
+            *next += 1;
+            match state[v] {
+                0 => {
+                    state[v] = 1;
+                    stack.push((v, 0));
+                }
+                1 => latches[v].push(u),
+                _ => {}
+            }
+        } else {
+            state[u] = 2;
+            stack.pop();
+        }
+    }
+    // The loop of header `h` is `h` plus every block that reaches one of
+    // its latches without passing through `h` (walking predecessors back
+    // from the latches and stopping at `h`). "Reachable from `h` and
+    // reaching the latch" is not the same thing in a nest: from an inner
+    // header one can leave the inner loop, go round the outer one and come
+    // back, so that test put the whole outer loop inside the inner one.
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, ss) in succ.iter().enumerate() {
+        for &v in ss {
+            preds[v as usize].push(u);
+        }
+    }
+    let mut depths = vec![0u32; n];
+    let mut mark = vec![usize::MAX; n];
+    for h in 0..n {
+        if latches[h].is_empty() {
+            continue;
+        }
+        mark[h] = h;
+        depths[h] += 1;
+        let mut work: Vec<usize> = Vec::new();
+        for &u in &latches[h] {
+            if mark[u] != h {
+                mark[u] = h;
+                depths[u] += 1;
+                work.push(u);
+            }
+        }
+        while let Some(x) = work.pop() {
+            for &p in &preds[x] {
+                if mark[p] != h {
+                    mark[p] = h;
+                    depths[p] += 1;
+                    work.push(p);
+                }
+            }
+        }
+    }
+    depths
+}
+
 /// The ALU mnemonic for a binary op that maps to one instruction.
 fn alu_mnem(op: BinOp) -> &'static str {
     match op {
@@ -7536,6 +7672,28 @@ mod tests {
     /// the liveness test was too coarse the fold bailed, and the backend paid
     /// `setl`/`movzbl`/store plus a second `cmp` on every iteration, which is
     /// what put `fib` and `callrec` behind LLVM. This checks the `setl` is gone.
+    /// A loop nested in another: the inner loop's blocks are at depth 2, the
+    /// outer loop's own blocks at depth 1, and nothing else is in a loop. A
+    /// test of "reachable from the header and reaching the latch" put the
+    /// whole outer loop inside the inner one (one can leave the inner loop,
+    /// go round the outer one and come back); counting every edge on a cycle
+    /// as a loop gave depths of the order of the loop's size.
+    #[test]
+    fn loop_depths_follow_the_nest() {
+        // bb0 -> bb1 (outer header) -> bb2 -> bb3 (inner header)
+        // bb3 -> bb4 (inner latch, back to bb3) | bb5 (outer latch, back to bb1)
+        // bb1 -> bb6 (exit)
+        let succ = vec![vec![1], vec![2, 6], vec![3], vec![4, 5], vec![3], vec![1], vec![]];
+        assert_eq!(loop_depths_of(&succ), vec![0, 1, 1, 2, 2, 1, 0]);
+        // An out-of-line `then` block that jumps back to its join is not a
+        // loop, though it jumps to a lower-numbered block.
+        let succ = vec![vec![2, 1], vec![3], vec![3], vec![]];
+        assert_eq!(loop_depths_of(&succ), vec![0, 0, 0, 0]);
+        // Two latches into one header are one loop.
+        let succ = vec![vec![1], vec![2, 3], vec![1], vec![1, 4], vec![]];
+        assert_eq!(loop_depths_of(&succ), vec![0, 1, 1, 1, 0]);
+    }
+
     /// Compile MIR text and return the named function's assembly. Only what
     /// `main` reaches is emitted, so `f` is called from a `main` that passes
     /// it a frame array and a runtime index.
