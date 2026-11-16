@@ -4268,6 +4268,11 @@ impl<'a> FnGen<'a> {
         if self.operand_ty(a).is_float() || self.operand_ty(b).is_float() {
             return self.gen_float_binary(dest, op, a, b);
         }
+        // `k * x` is `x * k`, so the constant forms of `mul_by_const` see it.
+        let (a, b) = match (op, a, b) {
+            (BinOp::Mul, Operand::Const(Const::Int(_)), Operand::Copy(_) | Operand::Move(_)) => (b, a),
+            _ => (a, b),
+        };
         // When the destination is a promoted register and the operator maps to
         // a single ALU instruction, update the register in place. This is the
         // accumulator pattern (`_acc = Add(_acc, k)`), which copy propagation
@@ -4318,6 +4323,12 @@ impl<'a> FnGen<'a> {
                 if av != reg {
                     self.emit(&format!("  mov {av}, {reg}"));
                 }
+            }
+            if let (BinOp::Mul, Some(seq)) = (op, mul_by_const(b)) {
+                for insn in seq {
+                    self.emit(&insn.replace("%rax", &reg));
+                }
+                return Ok(());
             }
             let (bv, _) = self.eval_operand_keep_rax(b)?;
             let bv = self.wide_imm(&bv, "%rcx");
@@ -4694,6 +4705,11 @@ impl<'a> FnGen<'a> {
         }
         let _ = a_mem;
         match op {
+            BinOp::Mul if mul_by_const(b).is_some() => {
+                for insn in mul_by_const(b).unwrap_or_default() {
+                    self.emit(&insn);
+                }
+            }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                 let (bv, _) = self.eval_operand_keep_rax(b)?;
                 let m = match op {
@@ -6325,6 +6341,32 @@ fn reads_reg(line: &str, r: &str) -> bool {
     } else {
         reg_mentions(rest, r)
     }
+}
+
+/// `%rax *= k` as a shift and a `lea` when that is quicker than `imul`, whose
+/// three cycles sit on the dependency chain of an accumulation like
+/// `cur = cur * 10 + d` (`textparse`): `x * 10` is `lea (x,x,4)` then
+/// `sal $1`, two one-cycle steps. Neither replacement sets flags anything
+/// reads: a plain `Mul` wraps, and a checked one is a `WithOverflow`, which
+/// recomputes its flags with an `imul` of its own.
+fn mul_by_const(b: &Operand) -> Option<Vec<String>> {
+    let Operand::Const(Const::Int(k)) = *b else { return None };
+    if k <= 0 {
+        return None;
+    }
+    let pow2 = |r: i64| r & (r - 1) == 0;
+    let shift = |r: i64| (r > 1).then(|| format!("  sal ${}, %rax", r.trailing_zeros()));
+    if pow2(k) {
+        return Some(shift(k).into_iter().collect());
+    }
+    for m in [9i64, 5, 3] {
+        if k % m == 0 && pow2(k / m) {
+            let mut v = vec![format!("  lea (%rax,%rax,{}), %rax", m - 1)];
+            v.extend(shift(k / m));
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Registers the code generator uses as scratch while evaluating an operand.
