@@ -152,6 +152,8 @@ struct FnGen<'a> {
     affinity: HashMap<u32, Vec<u32>>,
     /// Whether the body jumped to the shared panic exit (`trap_label`).
     trap_used: bool,
+    /// Loop depth of each block (`loop_depths`), for branch layout.
+    block_depth: Vec<u32>,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
     /// has revealed which slots the body actually touches.
     slot_map: Option<Vec<i64>>,
@@ -1294,6 +1296,7 @@ impl<'a> FnGen<'a> {
             reg_owners: HashMap::new(),
             affinity: HashMap::new(),
             trap_used: false,
+            block_depth: Vec::new(),
             slot_map: None,
             next_slot: 0,
             pinned: Vec::new(),
@@ -2314,6 +2317,7 @@ impl<'a> FnGen<'a> {
     fn gen_body(&mut self) -> Result<(), String> {
         self.pinned.clear();
         self.trap_used = false;
+        self.block_depth = self.loop_depths();
         // A hidden return pointer arrives in `%rdi` and is stashed in its frame
         // slot before the argument moves, which would overwrite `%rdi`. The
         // arguments of an aggregate-returning function therefore start at
@@ -2821,6 +2825,31 @@ impl<'a> FnGen<'a> {
             }
         }
         let (src, is_mem) = self.eval_operand(discr)?;
+        let next = bb + 1;
+        if let [(val, t)] = targets {
+            // The value's own target follows: fall into it and jump away only
+            // when the value differs (`je next; jmp other` ran two branches).
+            // Neither follows and `otherwise` is in a deeper loop: the loop
+            // goes on through it, so it takes the conditional jump, as in
+            // `try_branch_compare`.
+            let falls = *t == next && otherwise != next;
+            let loops = otherwise != next && *t != next && self.deeper(otherwise, *t);
+            if falls || loops {
+                let v = self.wide_imm(&format!("${val}"), "%rcx");
+                let src = if is_mem {
+                    self.emit(&format!("  mov {src}, %rax"));
+                    "%rax".to_string()
+                } else {
+                    src
+                };
+                self.emit(&format!("  cmp {v}, {src}"));
+                self.emit(&format!("  jne .Lbb{}", self.bb_label(otherwise)));
+                if loops {
+                    self.emit(&format!("  jmp .Lbb{}", self.bb_label(*t)));
+                }
+                return Ok(());
+            }
+        }
         if is_mem {
             self.emit(&format!("  mov {src}, %rax"));
             for (val, t) in targets {
@@ -2879,6 +2908,12 @@ impl<'a> FnGen<'a> {
         let next = bb + 1;
         if taken == next {
             self.emit(&format!("  {} .Lbb{}", jcc(negate_cc(op), u), self.bb_label(fallthrough)));
+        } else if fallthrough != next && self.deeper(fallthrough, taken) {
+            // Neither arm follows. The one in a deeper loop is where the loop
+            // goes on, so it gets the conditional jump: an iteration then takes
+            // one branch, where `jcc exit; jmp body` ran two.
+            self.emit(&format!("  {} .Lbb{}", jcc(negate_cc(op), u), self.bb_label(fallthrough)));
+            self.emit(&format!("  jmp .Lbb{}", self.bb_label(taken)));
         } else {
             self.emit(&format!("  {} .Lbb{}", jcc(op, u), self.bb_label(taken)));
             if fallthrough != next || fallthrough as usize >= self.func.blocks.len() {
@@ -2886,6 +2921,12 @@ impl<'a> FnGen<'a> {
             }
         }
         Ok(true)
+    }
+
+    /// Whether block `a` sits in a deeper loop than block `b`.
+    fn deeper(&self, a: u32, b: u32) -> bool {
+        let d = |x: u32| self.block_depth.get(x as usize).copied().unwrap_or(0);
+        d(a) > d(b)
     }
 
     // --- operands and places ----------------------------------------------
@@ -7866,6 +7907,41 @@ fn f(_1: &[i64; 8], _2: usize) -> i64 {
     }
 }
 ";
+
+    /// A loop whose latch switches on an integer (`while x != 0`, which rustc
+    /// prints as `switchInt(x) -> [0: exit, otherwise: body]`) with the exit
+    /// next in layout: the latch is one `jne` back to the body, not `je exit;
+    /// jmp body`.
+    #[test]
+    fn an_integer_loop_test_falls_into_its_exit() {
+        let f = asm_of(
+            "\
+fn f(_1: &[i64; 8], _2: i64) -> i64 {
+    let mut _0: i64;
+    let mut _3: i64;
+
+    bb0: {
+        _0 = const 0_i64;
+        _3 = copy _2;
+        switchInt(copy _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = Shr(copy _3, const 1_i32);
+        _0 = Add(copy _0, const 1_i64);
+        switchInt(copy _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb2: {
+        return;
+    }
+}
+",
+            "f",
+        );
+        assert!(f.contains("jne .Lbbf_1"), "{f}");
+        assert!(!f.contains("jmp .Lbbf_1"), "{f}");
+    }
 
     /// Run `moves` on a register file and return the argument registers.
     fn run_moves(moves: &[(&str, &'static str)]) -> Vec<(String, i64)> {
