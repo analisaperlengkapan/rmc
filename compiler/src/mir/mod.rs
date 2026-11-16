@@ -7672,6 +7672,183 @@ fn whole_local(op: &Operand) -> Option<u32> {
         .map(|p| p.local)
 }
 
+/// Turn a diamond that only picks one of two constants into straight-line
+/// arithmetic.
+///
+/// `x = if c { A } else { B }` reaches MIR as a `switchInt` on a `bool` whose
+/// two arms each store a constant into the same local and meet again. When `c`
+/// depends on data (`bfs` draws its walls from a pseudo-random stream), the
+/// branch mispredicts about as often as it goes either way, at ~15 cycles a
+/// time, where LLVM selects instead. The select is `c as T` for `1`/`0`,
+/// `(c as T) ^ 1` for `0`/`1`, and `(c as T) * (A - B) + B` for any other pair,
+/// computed in 64 bits (where the wrapping arithmetic is exact) and truncated
+/// to a narrower `T`. A switch on an integer (`if x & 1 == 0` reaches MIR as
+/// `switchInt(x & 1) -> [0: ..]`) first materialises `c = d != v`. The arms
+/// are constant stores, so computing the value on both paths has no side
+/// effect.
+pub fn select_diamonds(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        if f.select_diamonds() {
+            f.prune_unreachable();
+            f.merge_blocks();
+        }
+    }
+}
+
+impl Function {
+    fn select_diamonds(&mut self) -> bool {
+        let n = self.blocks.len();
+        let mut preds = vec![0u32; n];
+        for blk in &self.blocks {
+            for s in successors(&blk.term) {
+                preds[s as usize] += 1;
+            }
+        }
+        // The constants an arm stores, by local, and where it goes next, when
+        // the arm is nothing but stores of constants into distinct whole
+        // locals. Each store becomes a few instructions on both paths, so an
+        // arm with more than `MAX_STORES` keeps its branch.
+        const MAX_STORES: usize = 4;
+        let arm = |b: u32| -> Option<(BTreeMap<u32, i64>, u32)> {
+            let blk = &self.blocks[b as usize];
+            let Terminator::Goto(j) = blk.term else { return None };
+            let mut stores = BTreeMap::new();
+            for st in &blk.stmts {
+                match st {
+                    Stmt::Nop => {}
+                    Stmt::Assign(p, Rvalue::Use(Operand::Const(k))) if p.proj.is_empty() => {
+                        let v = match k {
+                            Const::Int(v) => *v,
+                            Const::Bool(b) => *b as i64,
+                            _ => return None,
+                        };
+                        if stores.insert(p.local, v).is_some() {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            (!stores.is_empty() && stores.len() <= MAX_STORES).then_some((stores, j))
+        };
+        let mut rewrites = Vec::new();
+        // Locals the rewrites add, numbered from the current end.
+        let mut fresh: Vec<Ty> = Vec::new();
+        let base = self.locals.len() as u32;
+        'diamond: for h in 0..n {
+            let Terminator::SwitchInt { discr, targets, otherwise } = &self.blocks[h].term else {
+                continue;
+            };
+            let Some(d) = whole_local(discr) else { continue };
+            if targets.len() != 1 {
+                continue;
+            }
+            let (v, hit) = targets[0];
+            let (miss, dty) = (*otherwise, (*self.locals[d as usize].ty).clone());
+            if hit == miss || hit as usize == h || miss as usize == h {
+                continue;
+            }
+            if preds[hit as usize] != 1 || preds[miss as usize] != 1 {
+                continue;
+            }
+            let (Some((at_miss, j)), Some((at_hit, j2))) = (arm(miss), arm(hit)) else {
+                continue;
+            };
+            if j != j2 || at_miss.keys().ne(at_hit.keys()) || at_miss.contains_key(&d) {
+                continue;
+            }
+            let d = Place { local: d, proj: Vec::new() };
+            let mut stmts = Vec::new();
+            let mut new_locals = Vec::new();
+            let mut new_local = |t: Ty, fresh: &Vec<Ty>| {
+                let l = base + (fresh.len() + new_locals.len()) as u32;
+                new_locals.push(t);
+                Place { local: l, proj: Vec::new() }
+            };
+            // `c` is a `bool` that is true where each local takes its value
+            // from `on`, false where it takes it from `off`.
+            let (c, on, off) = match (&dty, v) {
+                (Ty::Bool, 0) => (d, &at_miss, &at_hit),
+                (Ty::Bool, 1) => (d, &at_hit, &at_miss),
+                (Ty::Bool, _) => continue,
+                _ if dty.int_width_sign().is_some() => {
+                    // `switchInt(d) -> [v: hit, otherwise: miss]`: the miss
+                    // arm runs when `d != v`.
+                    let ne = new_local(Ty::Bool, &fresh);
+                    let cmp = Rvalue::Binary(BinOp::Ne, Operand::Copy(d), Operand::Const(Const::Int(v)));
+                    stmts.push(Stmt::Assign(ne.clone(), cmp));
+                    (ne, &at_miss, &at_hit)
+                }
+                _ => continue,
+            };
+            let cast = |to: &Ty, op: Operand, from: Ty| Rvalue::Cast {
+                from: Box::new(from),
+                to: Box::new(to.clone()),
+                op,
+                kind: CastKind::IntToInt,
+            };
+            let int = |k: i64| Operand::Const(Const::Int(k));
+            let cond = || Operand::Copy(c.clone());
+            for (&x, &a) in on {
+                let b = off[&x];
+                let ty = (*self.locals[x as usize].ty).clone();
+                let dest = Place { local: x, proj: Vec::new() };
+                match (&ty, a, b) {
+                    (Ty::Bool, a, b) if a == b => {
+                        stmts.push(Stmt::Assign(dest, Rvalue::Use(Operand::Const(Const::Bool(a != 0)))))
+                    }
+                    (Ty::Bool, 1, 0) => stmts.push(Stmt::Assign(dest, Rvalue::Use(cond()))),
+                    (Ty::Bool, 0, 1) => stmts.push(Stmt::Assign(dest, Rvalue::Unary(UnOp::Not, cond()))),
+                    _ if ty.int_width_sign().is_none() || matches!(ty, Ty::Bool) => continue 'diamond,
+                    (_, a, b) if a == b => stmts.push(Stmt::Assign(dest, Rvalue::Use(int(a)))),
+                    (_, 1, 0) => stmts.push(Stmt::Assign(dest, cast(&ty, cond(), Ty::Bool))),
+                    (_, 0, 1) => {
+                        stmts.push(Stmt::Assign(dest.clone(), cast(&ty, cond(), Ty::Bool)));
+                        let x = Operand::Copy(dest.clone());
+                        stmts.push(Stmt::Assign(dest, Rvalue::Binary(BinOp::BitXor, x, int(1))));
+                    }
+                    _ => {
+                        // `(c as T) * (a - b) + b`, in 64 bits: wrapping
+                        // arithmetic there is exact, and a narrower
+                        // destination takes the result by a truncating cast
+                        // (both constants fit it, so the cast only drops zero
+                        // or sign bits).
+                        let wide = matches!(ty.int_width_sign(), Some((8, _)));
+                        let w = if wide { dest.clone() } else { new_local(Ty::I64, &fresh) };
+                        let wt = if wide { ty.clone() } else { Ty::I64 };
+                        let wo = || Operand::Copy(w.clone());
+                        stmts.push(Stmt::Assign(w.clone(), cast(&wt, cond(), Ty::Bool)));
+                        match a.wrapping_sub(b) {
+                            1 => {}
+                            -1 => stmts.push(Stmt::Assign(w.clone(), Rvalue::Unary(UnOp::Neg, wo()))),
+                            k => stmts.push(Stmt::Assign(w.clone(), Rvalue::Binary(BinOp::Mul, wo(), int(k)))),
+                        }
+                        if b != 0 {
+                            stmts.push(Stmt::Assign(w.clone(), Rvalue::Binary(BinOp::Add, wo(), int(b))));
+                        }
+                        if !wide {
+                            stmts.push(Stmt::Assign(dest, cast(&ty, wo(), Ty::I64)));
+                        }
+                    }
+                }
+            }
+            fresh.extend(new_locals);
+            rewrites.push((h, j, stmts));
+        }
+        for ty in fresh {
+            self.locals.push(LocalDecl { ty: Box::new(ty), is_arg: false, name: None });
+        }
+        let changed = !rewrites.is_empty();
+        for (h, j, stmts) in rewrites {
+            // The arms keep their stores but lose their only predecessor;
+            // `prune_unreachable` drops them.
+            self.blocks[h].stmts.extend(stmts);
+            self.blocks[h].term = Terminator::Goto(j);
+        }
+        changed
+    }
+}
+
 /// Collapse `goto`-only blocks. LICM leaves a chain of empty blocks behind when
 /// it lifts a hoisted call out of its block, and each one costs a taken jump on
 /// every iteration of the loop it sits in. Redirecting the edges straight to the
@@ -9038,6 +9215,100 @@ fn main(_6: i64) -> () {
             format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
             "`i & 256` can reach a length of 256, so the check must stay"
         );
+    }
+
+    /// A diamond over `bool` whose arms store 1 and 0 becomes `c as i64`, and
+    /// one whose arms store two other constants becomes `c * (a - b) + b`; a
+    /// switch on an integer compares first. The arms and the switch go.
+    fn diamond_fixture(discr_ty: &str, switch: &str, then_val: &str, else_val: &str) -> String {
+        format!("\
+fn main(_1: {discr_ty}) -> i64 {{
+    let mut _0: i64;
+    let mut _2: i64;
+
+    bb0: {{
+        switchInt(copy _1) -> [{switch}];
+    }}
+
+    bb1: {{
+        StorageDead(_1);
+        _2 = const {then_val};
+        goto -> bb3;
+    }}
+
+    bb2: {{
+        _2 = const {else_val};
+        goto -> bb3;
+    }}
+
+    bb3: {{
+        _0 = copy _2;
+        return;
+    }}
+}}
+")
+    }
+
+    fn rvalues(f: &Function) -> Vec<String> {
+        f.blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|st| match st {
+                Stmt::Assign(_, rv) => Some(format!("{rv:?}")),
+                Stmt::Nop => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bool_diamond_of_one_and_zero_becomes_a_cast() {
+        // `[0: bb2, otherwise: bb1]`: true takes bb1 (1), false bb2 (0).
+        let mut prog = parse(&diamond_fixture("bool", "0: bb2, otherwise: bb1", "1_i64", "0_i64"))
+            .expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        assert_eq!(f.blocks.len(), 1, "the diamond collapses into one block");
+        let rvs = rvalues(f);
+        assert!(rvs[0].starts_with("Cast"), "{rvs:?}");
+        assert!(!rvs.iter().any(|r| r.contains("Mul") || r.contains("BitXor")), "{rvs:?}");
+    }
+
+    #[test]
+    fn a_bool_diamond_switching_on_one_picks_the_arms_the_other_way() {
+        // `[1: bb1, otherwise: bb2]`: true takes bb1 (0), false bb2 (1), so
+        // the value is `(c as i64) ^ 1`. Reading the arms the `[0: ..]` way
+        // round would give `c as i64` alone.
+        let mut prog = parse(&diamond_fixture("bool", "1: bb1, otherwise: bb2", "0_i64", "1_i64"))
+            .expect("fixture parses");
+        select_diamonds(&mut prog);
+        let rvs = rvalues(&prog.funcs[0]);
+        assert_eq!(rvs.len(), 3, "{rvs:?}");
+        assert!(rvs[0].starts_with("Cast") && rvs[1].contains("BitXor"), "{rvs:?}");
+    }
+
+    #[test]
+    fn an_integer_switch_with_two_constants_becomes_arithmetic() {
+        // `d != 0` takes bb1 (7), `d == 0` bb2 (-3): `(d != 0) * 10 - 3`.
+        let mut prog = parse(&diamond_fixture("i64", "0: bb2, otherwise: bb1", "7_i64", "-3_i64"))
+            .expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        assert_eq!(f.blocks.len(), 1);
+        let rvs = rvalues(f);
+        assert!(rvs[0].starts_with("Binary(Ne"), "{rvs:?}");
+        assert!(rvs.iter().any(|r| r.contains("Mul") && r.contains("Int(10)")), "{rvs:?}");
+        assert!(rvs.iter().any(|r| r.contains("Add") && r.contains("Int(-3)")), "{rvs:?}");
+    }
+
+    #[test]
+    fn a_diamond_with_a_non_constant_arm_keeps_its_branch() {
+        let text = diamond_fixture("bool", "0: bb2, otherwise: bb1", "1_i64", "0_i64")
+            .replace("_2 = const 0_i64;", "_2 = copy _0;");
+        let mut prog = parse(&text).expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        assert_eq!(f.blocks.len(), 4);
+        assert!(matches!(f.blocks[0].term, Terminator::SwitchInt { .. }));
     }
 
     #[test]
