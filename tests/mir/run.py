@@ -20,6 +20,7 @@ With case names, only those cases run (and the `reject/` cases are skipped).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -240,6 +241,18 @@ def build_rmc(name, binutils=False):
 
 REJECT = os.path.join(ROOT, "reject")
 
+# A reject fixture declares the feature its diagnostic must name in a
+# `// expect: <text>` comment. Checking only for a `note:` would accept a
+# rejection for an unrelated construct, so the marker is required and its text
+# must appear in the message.
+EXPECT_RE = re.compile(r"^[ \t]*//[ \t]*expect:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+
+
+def expected_feature(src):
+    with open(src, encoding="utf-8", errors="replace") as f:
+        m = EXPECT_RE.search(f.read())
+    return m.group(1) if m else None
+
 
 def run_reject_cases(verbose):
     """Cases in `reject/` that rustc accepts but rmc must refuse *cleanly*.
@@ -248,7 +261,9 @@ def run_reject_cases(verbose):
     construct must exit with status 1 and a message that names the feature, not
     a panic (status 101) or a stray `undefined symbol` from the linker. Each
     case is checked on both sides - the reference must build and run, so the
-    program is real, and rmc must fail with status 1.
+    program is real, and rmc must fail with status 1. The feature is the text
+    of the fixture's `// expect:` marker, so the test cannot pass on a
+    rejection for some other construct.
     """
     if not os.path.isdir(REJECT):
         return 0, 0
@@ -273,6 +288,7 @@ def run_reject_cases(verbose):
         out_bin = os.path.join(OUT, f"{name}.rej.bin")
         rc, _, err = run([RMC, "--rustc-frontend", src, "-o", out_bin])
         msg = err.decode(errors="replace")
+        want = expected_feature(src)
         if rc == 0:
             print(f"FAIL reject/{name}: rmc accepted a construct it cannot compile")
             failures += 1
@@ -280,8 +296,16 @@ def run_reject_cases(verbose):
             print(f"FAIL reject/{name}: rmc exited {rc} (want a clean 1, not a "
                   f"panic/abort):\n{msg}")
             failures += 1
+        elif want is None:
+            print(f"FAIL reject/{name}: the fixture declares no `// expect:` "
+                  f"feature, so any `note:` would pass:\n{msg}")
+            failures += 1
         elif "note:" not in msg:
             print(f"FAIL reject/{name}: the error names no feature (no `note:`):\n{msg}")
+            failures += 1
+        elif want not in msg:
+            print(f"FAIL reject/{name}: the error does not name `{want}`, so it "
+                  f"rejected for another reason:\n{msg}")
             failures += 1
         elif verbose:
             print(f"ok   reject/{name}")

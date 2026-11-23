@@ -2,6 +2,8 @@
 #![no_main]
 include!("../prelude.rs");
 
+// expect: black_box
+
 // `black_box::<&str>` moves two words in rustc (pointer and length); the
 // runtime's identity call moves one, so rmc must refuse it rather than drop the
 // length.
