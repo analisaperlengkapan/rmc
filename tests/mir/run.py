@@ -46,6 +46,9 @@ ARGS = {
     "narrowrange": [["0", "126"], ["0", "4"], ["0", "-1"], ["1", "15"], ["1", "3"],
                     ["2", "63"], ["2", "5"], ["3", "32766"], ["3", "10"],
                     ["4", "240"], ["4", "255"], ["4", "3"]],
+    # The split must not sink `x = 2` below a read or write through a pointer
+    # to `x`; zero, one and several loop trips.
+    "splitptr": [["7", "0"], ["7", "1"], ["-3", "5"]],
     "cmp": [["-5"], ["0"], ["7"]],
     "forloop": [["6"], ["0"]],
     "calls": [["10", "20", "30"]],

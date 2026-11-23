@@ -6213,10 +6213,11 @@ impl Function {
                     }
                     // The same block usually initialises the loop's own
                     // variables (`i = 0; sum = 0`) above the last use of a
-                    // saved value. A constant assignment commutes with every
-                    // statement that does not mention its destination, so
-                    // those move below the saves, where the values they would
-                    // have overlapped are already out of their registers.
+                    // saved value. A constant assignment to a local nothing
+                    // can reach through a pointer commutes with every
+                    // statement that does not mention it, so those move below
+                    // the saves, where the values they would have overlapped
+                    // are already out of their registers.
                     let is_save = |x: &Stmt| saved.iter().any(|&(v, sv)| {
                         matches!(x, Stmt::Assign(d, Rvalue::Use(Operand::Copy(q)))
                             if d.proj.is_empty() && q.proj.is_empty() && d.local == sv && q.local == v)
@@ -6230,6 +6231,13 @@ impl Function {
                                 continue;
                             }
                             let x = d.local;
+                            // A local whose address was taken is also read and
+                            // written through pointers that never name it
+                            // (`*p`), so the statements in between are not
+                            // known to leave it alone: it stays where it is.
+                            if escaped.contains(&x) {
+                                continue;
+                            }
                             let mentioned = stmts[i + 1..=last].iter().any(|y| {
                                 let mut m = HashSet::new();
                                 if let Stmt::Assign(p, rv) = y {
