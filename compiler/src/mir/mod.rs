@@ -2303,18 +2303,53 @@ fn black_box_arg_ty(n: &str) -> Option<&str> {
     rest.strip_suffix('>')
 }
 
-/// Whether a printed MIR type fits one register: an integer, `bool`, `char`,
-/// or a thin pointer/reference to a sized type.
+/// Whether a printed MIR type fits one register: an integer, `bool`, `char`, a
+/// float (rmc keeps one in a general-purpose register like any scalar), or a
+/// thin pointer/reference to a sized type, a fixed-size array included.
+///
+/// A `&str`, a `&[T]` and a `&dyn Trait` stay refused: rustc passes two words
+/// for each, and the identity call moves one.
 fn is_word_ty_text(t: &str) -> bool {
     let t = t.trim();
-    matches!(
+    if matches!(
         t,
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-            | "bool" | "char"
-    ) || ((t.starts_with('&') || t.starts_with("*const ") || t.starts_with("*mut "))
-        && !t.contains("str")
-        && !t.contains('[')
-        && !t.contains("dyn "))
+            | "bool" | "char" | "f32" | "f64"
+    ) {
+        return true;
+    }
+    let Some(pointee) = t
+        .strip_prefix("&mut ")
+        .or_else(|| t.strip_prefix('&'))
+        .or_else(|| t.strip_prefix("*const "))
+        .or_else(|| t.strip_prefix("*mut "))
+    else {
+        return false;
+    };
+    // A printed lifetime (`&'a str`) precedes the pointee.
+    let pointee = match pointee.trim_start().strip_prefix('\'') {
+        Some(rest) => rest.split_once(' ').map_or("", |(_, p)| p),
+        None => pointee,
+    }
+    .trim();
+    !(pointee.is_empty() || pointee == "str" || pointee.contains("dyn ") || is_slice_text(pointee))
+}
+
+/// `[T]`, as opposed to `[T; N]`: a bracketed type with no `;` at its top level.
+fn is_slice_text(t: &str) -> bool {
+    if !(t.starts_with('[') && t.ends_with(']')) {
+        return false;
+    }
+    let mut depth = 0i32;
+    for c in t.chars() {
+        match c {
+            '[' | '(' | '<' => depth += 1,
+            ']' | ')' | '>' => depth -= 1,
+            ';' if depth == 1 => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// See the call site in [`std_intrinsic_name`].
@@ -3077,6 +3112,9 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
     let s = fragment;
     let has = |needle: &str| s.contains(needle);
     // Order matters: the most specific construct first.
+    if has("black_box") {
+        return Some("`black_box` of a `&str`, a `&[T]` or an aggregate is not implemented on the MIR path (it moves more than one word); use it on an integer, `bool`, `char`, float or a thin reference");
+    }
     if has("::fmt::Display>::fmt")
         || has("::fmt::Debug>::fmt")
         || has("::fmt::LowerHex>::fmt")

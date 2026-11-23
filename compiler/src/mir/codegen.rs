@@ -3182,7 +3182,11 @@ impl<'a> FnGen<'a> {
             }
             Const::Zst => "$0".to_string(),
             Const::Agg { name, .. } => {
-                return Err(format!("mir_codegen: aggregate constant not yet materialised: `{name}`").into());
+                return Err(unsupported_note(
+                    &format!("mir_codegen: aggregate constant not yet materialised: `{name}`"),
+                    name,
+                )
+                .into());
             }
             Const::Alloc { id, place } => {
                 let label = self
