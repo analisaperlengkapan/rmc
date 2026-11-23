@@ -60,10 +60,23 @@ fn dropped_arr(k: i64) {
     out(a[0].0 as i64 + a[1].0 as i64);
 }
 
+// A repeated constant tuple: the copy length must be the tuple's full element
+// stride, so an untouched element's `.1` is not truncated by the next element's
+// copy. `0x1122334455667788` differs in every byte, so a short copy shows up.
+// One element is written at a runtime index and a different one is read at a
+// runtime index, so the read cannot be folded to the constant.
+#[inline(never)]
+fn repeated(k: i64, i: usize) -> i64 {
+    let mut a = [(1u8, 0x1122334455667788i64); 4];
+    a[(k as usize) % 4].1 = 901;
+    a[i % 4].1 + a[(i + 1) % 4].0 as i64
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
     let i = arg(2) as usize;
+    out(repeated(k, i));
     out(wide(k, i));
     out(narrow(k, i));
     dropped(k);

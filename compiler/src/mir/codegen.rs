@@ -3499,9 +3499,11 @@ impl<'a> FnGen<'a> {
     /// A field starts where the previous one ends, but never below word `k`,
     /// because a tuple constant is written one word per field
     /// (`const_agg_layout`) and must land where a declared `(u8, i64)` reads its
-    /// second field. The size runs to the end of the last field. It used to be
-    /// the sum of the field sizes, 9 for `(u8, i64)` with the `i64` at byte 8, so
-    /// in `[(u8, i64); N]` every element's second field overlapped the next
+    /// second field. The size runs to the end of the last field and is rounded
+    /// up to a whole word, so an array's element stride matches the materialised
+    /// constant's word-sized fields: `(u8, u8)` is 16 bytes, not 9. It used to
+    /// be the sum of the field sizes, 9 for `(u8, i64)` with the `i64` at byte
+    /// 8, so in `[(u8, i64); N]` every element's second field overlapped the next
     /// element and a copy of one element stopped a byte into it.
     fn tuple_layout(&self, tys: &[&Ty]) -> (Vec<i64>, i64) {
         let mut offs = Vec::with_capacity(tys.len());
@@ -3511,7 +3513,8 @@ impl<'a> FnGen<'a> {
             offs.push(off);
             end = off + self.size_of_ty(t);
         }
-        (offs, end.max(8))
+        let size = ((end.max(8) + 7) / 8) * 8;
+        (offs, size)
     }
 
     /// Byte size of a type as the backend lays it out. A struct is the sum of
@@ -4053,7 +4056,11 @@ impl<'a> FnGen<'a> {
                 // `textparse` segfault), and `[S { .. }; n]` initialised only
                 // the first word of each multi-word element.
                 let elem = elem_ty(&self.place_ty(dest));
-                let esize = self.size_of_ty(&elem);
+                // The array's real element stride, not just the field widths:
+                // a tuple is materialised one word per field, so copying the
+                // sum of its field sizes would stop inside the second field.
+                let stride = if *count > 0 { self.place_size(dest) / *count as i64 } else { 0 };
+                let esize = stride.max(self.size_of_ty(&elem));
                 if *count == 0 || esize == 0 {
                     // Nothing to store.
                 } else if elem.is_aggregate() {
