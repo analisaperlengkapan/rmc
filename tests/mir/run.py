@@ -244,14 +244,22 @@ REJECT = os.path.join(ROOT, "reject")
 # A reject fixture declares the feature its diagnostic must name in a
 # `// expect: <text>` comment. Checking only for a `note:` would accept a
 # rejection for an unrelated construct, so the marker is required and its text
-# must appear in the message.
+# must appear in the note itself. The parser quotes the rejected statement,
+# which can contain the feature name (`black_box`), so a match anywhere in
+# stderr would pass even when the note names another limitation.
 EXPECT_RE = re.compile(r"^[ \t]*//[ \t]*expect:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+NOTE_RE = re.compile(r"^[ \t]*note:[ \t]*(.*)$", re.MULTILINE)
 
 
 def expected_feature(src):
     with open(src, encoding="utf-8", errors="replace") as f:
         m = EXPECT_RE.search(f.read())
     return m.group(1) if m else None
+
+
+def note_text(msg):
+    """The text of every `note:` line, without the surrounding error/quoted line."""
+    return "\n".join(NOTE_RE.findall(msg))
 
 
 def run_reject_cases(verbose):
@@ -262,8 +270,8 @@ def run_reject_cases(verbose):
     a panic (status 101) or a stray `undefined symbol` from the linker. Each
     case is checked on both sides - the reference must build and run, so the
     program is real, and rmc must fail with status 1. The feature is the text
-    of the fixture's `// expect:` marker, so the test cannot pass on a
-    rejection for some other construct.
+    of the fixture's `// expect:` marker and must appear in the `note:` line,
+    so the test cannot pass on a rejection for some other construct.
     """
     if not os.path.isdir(REJECT):
         return 0, 0
@@ -300,12 +308,12 @@ def run_reject_cases(verbose):
             print(f"FAIL reject/{name}: the fixture declares no `// expect:` "
                   f"feature, so any `note:` would pass:\n{msg}")
             failures += 1
-        elif "note:" not in msg:
+        elif not NOTE_RE.search(msg):
             print(f"FAIL reject/{name}: the error names no feature (no `note:`):\n{msg}")
             failures += 1
-        elif want not in msg:
-            print(f"FAIL reject/{name}: the error does not name `{want}`, so it "
-                  f"rejected for another reason:\n{msg}")
+        elif want not in note_text(msg):
+            print(f"FAIL reject/{name}: the error's note does not name `{want}`, "
+                  f"so it rejected for another reason:\n{msg}")
             failures += 1
         elif verbose:
             print(f"ok   reject/{name}")
