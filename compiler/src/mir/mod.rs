@@ -7415,7 +7415,8 @@ fn facts_at_term(
         // self-update (`x = x + 1`) still sees what was known about `x`.
         let new_range = match s {
             Stmt::Assign(d, rv) if d.proj.is_empty() && !escaped.contains(&d.local) => {
-                rv_range(&facts, rv)
+                let dest = locals.get(d.local as usize).and_then(|l| l.ty.int_width_sign());
+                rv_range(&facts, rv, dest)
             }
             _ => None,
         };
@@ -7512,9 +7513,20 @@ fn facts_at_term(
 /// Arithmetic on bounded non-negative values stays bounded: `life`'s index
 /// `(y & 127) * 128 + (x & 127)` is at most 16383, so its check against 16384
 /// is redundant. Every bound is computed without overflow and kept within
-/// `i64`, so the value reads the same as signed or unsigned and no wrapping can
-/// have happened.
-fn rv_range(facts: &AssertFacts, rv: &Rvalue) -> Option<(Option<u64>, bool)> {
+/// `i64`, so a 64-bit value reads the same as signed or unsigned and no wrapping
+/// can have happened.
+///
+/// `dest` is the destination's `(width in bytes, signed)`; `None` for anything
+/// that is not an integer. A narrower type wraps inside its own width, which the
+/// 64-bit bound does not see: in an `i8`, `126 + 2` is -128, and a `usize` cast
+/// of that is huge, though the bound said 128. An unsigned result that wraps is
+/// only smaller than the bound, so it stays valid; a signed one is kept only
+/// when the bound fits the width, and then no wrap can have happened.
+fn rv_range(
+    facts: &AssertFacts,
+    rv: &Rvalue,
+    dest: Option<(u8, bool)>,
+) -> Option<(Option<u64>, bool)> {
     let fits = |m: u64| m <= i64::MAX as u64;
     let (bound, nonneg) = match rv {
         Rvalue::Use(op) => (facts.bound_of(op), facts.nonneg_of(op)),
@@ -7556,10 +7568,20 @@ fn rv_range(facts: &AssertFacts, rv: &Rvalue) -> Option<(Option<u64>, bool)> {
                 (BinOp::Shr, Some(x), _) => Some(x),
                 (BinOp::Div, Some(x), Some(_)) => Some(x),
                 (BinOp::Rem, Some(x), Some(c)) if c > 0 => Some(x.min(c - 1)),
-                (BinOp::BitOr, Some(x), Some(y)) => Some(u64::MAX >> x.max(y).leading_zeros()),
+                // The smallest all-ones mask covering both bounds. With both
+                // zero there is no bit to cover (`leading_zeros` is 64, and a
+                // shift by 64 overflows): the result is zero.
+                (BinOp::BitOr, Some(x), Some(y)) => {
+                    Some(u64::MAX.checked_shr(x.max(y).leading_zeros()).unwrap_or(0))
+                }
                 _ => None,
             };
-            (bound.filter(|m| fits(*m)), false)
+            let fits_dest = |m: u64| match dest {
+                Some((w, true)) if w < 8 => m < (1u64 << (8 * w as u32 - 1)),
+                Some(_) => true,
+                None => false,
+            };
+            (bound.filter(|m| fits(*m) && fits_dest(*m)), false)
         }
         _ => return None,
     };
@@ -9994,5 +10016,46 @@ fn main() -> () {
             format!("{:?}", on.funcs[0].blocks[0].term).contains("Goto(2)"),
             "checks on must take the `otherwise` arm (bb2)"
         );
+    }
+
+    /// `a | b` with both bounds zero is zero. The mask `u64::MAX >> leading_zeros`
+    /// shifted by 64 there: a panic in a debug build, and in release a shift
+    /// that wraps to 0 and leaves the full mask (so no bound at all).
+    #[test]
+    fn or_of_two_zero_bounds_is_bounded_by_zero() {
+        let mut facts = AssertFacts::default();
+        facts.masked.insert(1, 0);
+        facts.masked.insert(2, 0);
+        let rv = Rvalue::Binary(
+            BinOp::BitOr,
+            Operand::Copy(Place { local: 1, proj: Vec::new() }),
+            Operand::Copy(Place { local: 2, proj: Vec::new() }),
+        );
+        assert_eq!(rv_range(&facts, &rv, Some((8, true))), Some((Some(0), true)));
+        // Non-zero bounds still round up to the covering mask.
+        facts.masked.insert(1, 5);
+        assert_eq!(rv_range(&facts, &rv, Some((8, true))), Some((Some(7), true)));
+    }
+
+    /// A sum that does not fit a narrow signed type wraps there: `126 + 2` in an
+    /// `i8` is -128. The bound is dropped for the narrow type and kept for the
+    /// types whose range holds it.
+    #[test]
+    fn a_bound_past_a_narrow_signed_range_is_dropped() {
+        let mut facts = AssertFacts::default();
+        facts.masked.insert(1, 126);
+        let rv = Rvalue::Binary(
+            BinOp::Add,
+            Operand::Copy(Place { local: 1, proj: Vec::new() }),
+            Operand::Const(Const::Int(2)),
+        );
+        assert_eq!(rv_range(&facts, &rv, Some((1, true))), None, "i8: 128 wraps");
+        assert_eq!(rv_range(&facts, &rv, Some((1, false))), Some((Some(128), true)), "u8");
+        assert_eq!(rv_range(&facts, &rv, Some((2, true))), Some((Some(128), true)), "i16");
+        assert_eq!(rv_range(&facts, &rv, Some((8, true))), Some((Some(128), true)), "i64");
+        assert_eq!(rv_range(&facts, &rv, None), None, "not an integer");
+        // 125 + 2 = 127 fits an i8.
+        facts.masked.insert(1, 125);
+        assert_eq!(rv_range(&facts, &rv, Some((1, true))), Some((Some(127), true)));
     }
 }
