@@ -7729,8 +7729,9 @@ impl Function {
     /// destination `D` with it is folded into `P`: `P` goes to `D` when
     /// `goes(P, D) | goes(B, D)`, and to `B`'s other destination otherwise.
     /// `B`'s own statements (at most four, all `speculatable`, defining
-    /// locals nothing outside `B` reads) move into `P`; a fold leaves three
-    /// (two conditions and their `|`), so a chain of three tests folds whole. Only chains whose two
+    /// locals nothing outside `B` reads and `B` does not read before writing)
+    /// move into `P`; a fold leaves three (two conditions and their `|`), so
+    /// a chain of three tests folds whole. Only chains whose two
     /// destinations are constant arms meeting at one join are folded, so a
     /// loop test or a branch around real work keeps its shape (and the
     /// bounds facts later passes read off it); `select_diamonds` then turns
@@ -7801,6 +7802,22 @@ impl Function {
                         written.insert(dst.local);
                     }
                     if !written.is_empty() && self.read_outside(bu, &written) {
+                        continue;
+                    }
+                    // Nor may `B` read a local it writes before writing it:
+                    // that local carries a value from one run of `B` to the
+                    // next (`c || { t += 1; t > 5 }`), and running the write
+                    // on `P`'s other path too would change it.
+                    let mut defined = HashSet::new();
+                    let mut carried = false;
+                    for st in &body {
+                        let Stmt::Assign(dst, rv) = st else { continue };
+                        let mut reads = HashSet::new();
+                        rvalue_mentions(rv, &mut reads);
+                        carried |= reads.iter().any(|l| written.contains(l) && !defined.contains(l));
+                        defined.insert(dst.local);
+                    }
+                    if carried {
                         continue;
                     }
                     found = Some((p, bu, dd, e));
@@ -9808,6 +9825,50 @@ fn main(_1: i64, _2: i64) -> i64 {{
         let f = &prog.funcs[0];
         let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
         assert_eq!(switches, 3);
+    }
+
+    /// `c || { t += 1; t > 5 }` into a select, with `t` used nowhere else:
+    /// the increment must not move into the test of `c`, or it runs on the
+    /// iterations where `c` short-circuits.
+    #[test]
+    fn a_value_carried_between_runs_of_a_test_is_not_speculated() {
+        let text = "\
+fn main(_1: bool, _2: i64) -> i64 {
+    let mut _0: i64;
+    let mut _3: i64;
+    let mut _4: bool;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _2 = Add(copy _2, const 1_i64);
+        _4 = Gt(copy _2, const 5_i64);
+        switchInt(move _4) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        _3 = const 1_i64;
+        goto -> bb4;
+    }
+
+    bb3: {
+        _3 = const 0_i64;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _0 = copy _3;
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        select_diamonds(&mut prog);
+        let f = &prog.funcs[0];
+        let switches = f.blocks.iter().filter(|b| matches!(b.term, Terminator::SwitchInt { .. })).count();
+        assert_eq!(switches, 2, "{:?}", f.blocks);
     }
 
     #[test]

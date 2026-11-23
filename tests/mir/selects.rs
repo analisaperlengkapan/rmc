@@ -94,6 +94,30 @@ fn chains(k: i64, m: i64) -> i64 {
     t
 }
 
+// A condition with a side effect on a value it alone uses: `t` must count
+// only the iterations where `c1` is false. Moving `t += 1` into the test of
+// `c1` (to fold the chain into one condition) counted every iteration.
+#[inline(never)]
+fn carried(k: i64) -> i64 {
+    let mut t = 0i64;
+    let mut r = 0i64;
+    let mut i = 0;
+    while i < 40 {
+        let c1 = (i + k) % 3 == 0;
+        let x: i64 = if c1 || {
+            t += 1;
+            t > 5
+        } {
+            1
+        } else {
+            0
+        };
+        r = r.wrapping_mul(2) ^ x;
+        i += 1;
+    }
+    r
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
@@ -106,5 +130,6 @@ pub extern "C" fn main() -> i64 {
     out(stream(k, 1000));
     out(chains(k, 1));
     out(chains(k, -k));
+    out(carried(k));
     0
 }
