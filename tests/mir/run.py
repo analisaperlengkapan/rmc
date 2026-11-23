@@ -14,7 +14,9 @@ the only variable is the code generator. They must print identical stdout and
 exit with the same status. This is the suite that actually exercises the MIR
 path; `tests/run.py` covers the AST path.
 
-Usage: python3 tests/mir/run.py [-v]
+Usage: python3 tests/mir/run.py [-v] [case ...]
+
+With case names, only those cases run (and the `reject/` cases are skipped).
 """
 import json
 import os
@@ -282,6 +284,12 @@ def main():
     )
     if not cases:
         sys.exit("no cases found")
+    only = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if only:
+        unknown = [n for n in only if n not in cases]
+        if unknown:
+            sys.exit(f"unknown case(s): {', '.join(unknown)}")
+        cases = [n for n in cases if n in only]
 
     failures = 0
     skipped = 0
@@ -322,7 +330,7 @@ def main():
 
     # `reject/` cases: rustc accepts, rmc must refuse cleanly. Counted
     # separately so the "N cases matched" line stays about the positive suite.
-    n_reject, reject_failures = run_reject_cases(verbose)
+    n_reject, reject_failures = (0, 0) if only else run_reject_cases(verbose)
     failures += reject_failures
 
     total = len(cases)
