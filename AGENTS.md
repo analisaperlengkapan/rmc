@@ -217,7 +217,9 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
   overflow check keeps its comparisons when another block reads them.
 * **`split_loop_ranges` is an identity**: a save follows the entry block's
   last mention of its value, a restore precedes the exit's first mention, and
-  a new edge block joins every enclosing loop.
+  a new edge block joins every enclosing loop. It sinks a constant assignment
+  only for a local whose address was never taken: a read through a pointer
+  does not name it.
 * **asmopt runs once, after every text peephole**, never before one, and
   leaves a function untouched when it meets a line it does not model. It
   trusts a call's `#argregs N` note (written by `gen_call`) for which argument
@@ -230,6 +232,12 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
   it ends in constant arms.
 * **`fold_range_checks` runs after `drop_redundant_asserts`**, which reads
   bounds off the original tests.
+* **A range bound is for the destination's width**: `rv_range` takes the
+  destination type, and a signed result narrower than 64 bits keeps a bound only
+  when it fits (`126 + 2` in an `i8` is `-128`, not 128).
+* **A tuple has one layout** (`tuple_layout`): constant, field offset, element
+  stride, copy length and drop glue all come from it; field `k` starts at
+  `max(end of the previous field, 8k)` and the size runs to the end of the last.
 * **Call arguments are one parallel assignment**: operand evaluation writes
   only `SCRATCH_REGS`; a cycle goes through `%r11`/`%r10`, never promoted.
 * The dylib links one exact nightly (`backend/rust-toolchain.toml`); every

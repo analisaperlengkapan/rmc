@@ -231,6 +231,33 @@ every local through the interference graph exposed it in `light` and
 allocations (`ROADMAP.md`, section 1). The MIR fuzzer generates only `i64`
 values, which is why it never found number 1.
 
+### Defects found in review of this PR
+
+A reviewer read the diff and found three wrong-output defects and four
+smaller points. Each was reproduced first; each fix has a test that fails without
+it (the new cases are `narrowrange`, `splitptr`, `tupleelem` and `blackbox` in
+`tests/mir`).
+
+| # | symptom | root cause | introduced by | test |
+|---|---|---|---|---|
+| 1 | `t[(x & 126_i8).wrapping_add(2) as usize]` on a 129-element array read out of bounds instead of panicking for `x = 126` | `rv_range` bounded the 64-bit sum (128) and never asked whether the destination, an `i8`, could hold it; the cast to `usize` of the wrapped `-128` kept the false bound and the check was dropped | this PR (bounds from value ranges) | `tests/mir/narrowrange`, 2 unit tests |
+| 2 | `x = 2; v = *p + param` read the old `x` once the loop below it was split | the split sinks the entry block's constant assignments below its saves, comparing locals by id; a read through `p` never names `x` | this PR (live-range splitting) | `tests/mir/splitptr` |
+| 3 | `[E; 7]` with `E: (u8, i64)`, and any `[(u8, u8); N]`, read other bytes than were written | a tuple measured the sum of its field sizes (9, and 8) but put field `k` at `max(sum, 8k)`, so the second field ran past its element: elements overlapped, and one-element copies stopped short. The same mismatch made the drop glue of `[(u8, G); 2]` read the wrong offset | before this PR; the repeat path exposed it | `tests/mir/tupleelem` |
+
+The review also showed that a `>> 64` in the bitwise-OR bound (both bounds zero)
+panics a debug build of the compiler and, in release, loses the bound. Fixed with
+a unit test. `black_box` of an `f32`/`f64` and of a reference to a fixed-size
+array was refused although both fit one register; both now work
+(`tests/mir/blackbox`), and the refusal of a `&str`/`&[T]` names `black_box`
+(`tests/mir/reject/blackbox_str`).
+
+Two points are not defects. `check_frame_sizes` is specific to the AST route,
+whose arrays take 8 bytes an element; the MIR route lays a frame out at its real
+size, so a 20 MB local overflows the 8 MiB stack and segfaults, exactly as the
+rustc build of the same program does. `suffix_imm_mem` widens every unsuffixed
+immediate-to-memory ALU op by design; a narrower one is emitted with its own
+suffix, which it leaves alone (documented, and pinned by a unit test).
+
 Open, not fixed: rmc's own front end treats `u64`/`usize` as `i64` (a
 documented deviation), so comparisons and divisions of values at or above 2^63
 differ from rustc.
