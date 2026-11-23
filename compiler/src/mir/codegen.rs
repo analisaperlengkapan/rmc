@@ -6981,6 +6981,12 @@ fn finish_function(text: &str) -> String {
 /// once, after every rewrite has run, rather than taught to each pass.
 /// `mov $imm, mem` is left alone: its unsuffixed width is 32 bits in both
 /// assemblers, and the generator sizes those stores itself.
+///
+/// Every unsuffixed form is taken to be a word, so a deliberately narrower
+/// immediate-to-memory ALU op must be emitted with its own suffix (`addb`,
+/// `cmpw`, `andl`); those do not match here and pass through unchanged. An
+/// unsuffixed narrow op would be widened, which is the width the assemblers
+/// could not agree on in the first place.
 fn suffix_imm_mem(body: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
     for line in body.lines() {
@@ -7831,6 +7837,16 @@ fn bump(p: &Place, counts: &mut HashMap<u32, u32>, projected: &mut HashSet<u32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unsuffixed immediate-to-memory ALU op becomes a 64-bit one, whatever
+    /// the addressing mode; a suffixed op, a register destination and `mov` are
+    /// left alone.
+    #[test]
+    fn suffix_imm_mem_widens_only_the_unsuffixed_memory_forms() {
+        let body = "  add $1, -8(%rbp)\n  cmp $32, (%rax,%rcx,8)\n  addb $1, (%rax)\n  cmpl $3, 8(%rbp)\n  add $1, %rax\n  mov $1, -8(%rbp)\n  and %rax, -8(%rbp)\n";
+        let want = "  addq $1, -8(%rbp)\n  cmpq $32, (%rax,%rcx,8)\n  addb $1, (%rax)\n  cmpl $3, 8(%rbp)\n  add $1, %rax\n  mov $1, -8(%rbp)\n  and %rax, -8(%rbp)\n";
+        assert_eq!(suffix_imm_mem(body), want);
+    }
 
     /// The assembly text of the first function named `name` in `asm`.
     fn func_asm(asm: &str, name: &str) -> String {
