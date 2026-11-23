@@ -3447,3 +3447,164 @@ x == i64::MIN))` folded both comparisons into the branch and dropped their
 statements while rustc's GVN reused `x == i64::MIN` for a later division of
 the same `x`, which then read a `bool` that was never stored
 (`tests/std/fuzz_mir_21_33`).
+
+## Run-time code quality, third and fourth rounds (November 2026)
+
+Measured as before: the dumped MIR of each benchmark compiled by two `rmcmir`
+builds, min of 9 or more interleaved runs, both sets judged, on one Intel Xeon
+(family 6 model 173).
+
+### `split_loop_ranges` is an identity
+
+A local has one home for its whole life, so a value an inner loop never
+mentions (an outer counter, a bound, an outer accumulator) held a register
+through that loop while the loop's own temporaries went to the frame on every
+iteration. Three re-weightings of the allocator only moved the loss between
+programs. `split_loop_ranges` is a MIR transformation instead: for a loop
+whose live register candidates exceed the nine allocatable registers (five
+across a call), every scalar live into the header, not mentioned inside and
+not address-taken is copied out before the loop and back at each exit. It is
+an identity whatever liveness says, given its placement rules: a save goes
+after the entry block's last mention of the value (or on a new edge block when
+the entry block's own call writes it), constant initialisers move below the
+saves, a restore goes before the first mention in the exit target (or on a new
+edge block when the target has predecessors outside the loop), and new blocks
+join every enclosing loop. `merge_blocks` runs again after `rotate_loops`,
+which leaves a guard in a block of its own, so saves and initialisers can be
+ordered within one block.
+
+### Copies may share a register; reborrows only read the pointer
+
+A copy or a cast reads its one operand before writing, so source and
+destination need not interfere for that read, and after a true copy they hold
+the same value. Copy-related locals are affinities, tried in each other's
+register first, which makes `idx = i as usize` and the split's save/restore
+copies free when the register is. A value-changing cast (`x as u8`) still
+interferes. `&*p`, `&(*p).f`, `Len(*p)` and `discriminant(*p)` read `p`; they
+used to mark it address-taken and keep it in the frame.
+
+### asmopt runs once, after every text peephole
+
+`mir/asmopt.rs` models each finished function's instructions with explicit
+use, kill and write sets and gives up, text untouched, on any line it does not
+model. On top of register liveness it propagates copies, folds an address into
+the access that uses it, retargets a value computed in a scratch register to
+its home, and deletes dead flag-neutral moves, loads and `lea`s. It never
+removes a flag-setting instruction and never moves a memory access. It must
+run after the slot peepholes and never before one: once addresses are folded,
+a frame array is written as `-48(%rbp)` and read as `-48(%rbp,%rsi,8)`, and the
+slot peepholes take an `N(%rbp)` operand to be a scalar slot nothing else
+reaches. The code generator writes every call as `call f #argregs N`, and a
+call reads exactly its first N argument registers; a call without the note
+(hand-written code) is taken to read all six and `%rax`, `%r10`, `%r11`. That
+default kept a dead copy into `%r8` or `%r10` alive before a one-argument call
+until the note existed. Undercounting N deletes an argument's setup: three
+`tests/mir` cases fail when the count is one short.
+
+### A dropped assertion rests on value ranges
+
+`drop_redundant_asserts` tracks, per local, an upper bound on a non-negative
+value and whether it is non-negative, learned from arithmetic (each bound
+computed without overflow and kept within `i64`), from a passed test on its
+edge, from a passed assertion, and through 64-bit casts (an alias of the same
+bits). At a join a bound survives as the larger side, except at a loop header,
+where a differing bound is dropped so an unbounded counter cannot climb a step
+per sweep. The soundness rules of the second round still hold (a call kills
+its destination; no facts about an address-taken local). Removing a check can
+cost a register: the index loses a use, and before live-range splitting that
+made `life` slower.
+
+### Scalar replacement of aggregates
+
+`scalarize_aggregates` gives each field of a struct or tuple local a scalar of
+its own when every use is a field access, a whole copy, or a literal with one
+operand per field, and every field is a full word (the inferred shapes are
+only reliable for those). A local whose address is taken, that crosses a call,
+is dropped or repeated stays whole. A copy through an index or pointer takes
+the address once.
+
+### Loop depth is the depth-first nest
+
+A back edge is an edge to a block on the depth-first stack; each header is one
+loop however many latches reach it; a loop's body is the predecessors walked
+back from its latches to its header. The old rule counted every edge into a
+block that could reach the edge's source, which gave every block of a two-deep
+nest depth 6, so with weights of 8^depth outer values outranked inner ones.
+Hoisted constants also rank after every local: a constant holds its register
+for the whole function, so one used in one loop took a register from all the
+others, while inline it costs one `movabs` per use.
+
+### Speculated statements must be speculatable
+
+`select_diamonds` turns a diamond whose two single-predecessor arms store
+constants into the same locals into arithmetic on the condition (`c as T`,
+`(c as T) ^ 1`, or `(c as T) * (A - B) + B` in 64 bits, truncated to a narrower
+`T`); a switch on an integer first materialises `d != v`. Arms of more than
+four stores keep their branch. `fold_select_conditions` first folds a
+short-circuit chain into one condition (`P` goes to `D` on `goes(P, D) |
+goes(B, D)`), moving `B`'s statements into `P`. Those statements then run on
+paths that did not run them, so they must be **speculatable**: register
+arithmetic and comparisons only, no read through a pointer or at a computed
+index (a bounds fact may hold only on the original path), no `/` or `%`, at
+most four of them, defining locals nothing outside `B` reads and that `B`
+itself does not read before writing, with `move` turned into `copy`. The
+second rule was missing at first: in `c || { t += 1; t > 5 }` with `t` used
+nowhere else, the increment moved into `P` ran on iterations where `c`
+short-circuits (`tests/mir/selects`, `carried`). A chain is folded only when both its destinations are
+constant arms meeting at one join: loop tests and branches around real work
+keep their shape, and with it the bounds facts later passes read off them.
+
+Kept as a branch on purpose: `if x > K { x -= K }`. `light`'s branch is
+random and would gain from a conditional move; `heavy` has the same shape with
+a predictable branch, where the move would put the comparison on the
+loop-carried chain. Without profile data they cannot be told apart, and the
+move is why LLVM runs `heavy` 1.5x slower than rmc.
+
+### fold_range_checks runs after drop_redundant_asserts
+
+`lo <= x && x <= hi` is `(x as u64) - lo <= hi - lo` as one unsigned compare:
+exact for every integer type, since the cast keeps values distinct. It runs
+after `drop_redundant_asserts`, which reads bounds off the original tests (`i
+>= 0 && i < LEN` guards `a[i]`). Each switch is read both ways (pass on the
+comparison or on its complement); reading `[1: a, ..]` as the complement was a
+bug in the first version that the unit tests now pin.
+
+### A store's place counts toward promotion
+
+`plan_promotion` weighted locals by their reads in right-hand sides and
+terminators only. The index of `a[i] = x` therefore had no weight and never
+became a register candidate (stored to the frame and reloaded into `%rcx` for
+every store in `life`'s inner loop), and a pointer written through was
+disqualified. A written place is now counted as a read of the place is: its
+index locals and its `Deref` base.
+
+### Call arguments are one parallel assignment
+
+Arguments were moved into `%rdi`..`%r9` one by one, so every register-held
+argument but the last went through a frame slot in case an earlier move
+overwrote it. Operand evaluation writes only scratch registers, so a promoted
+local's register is as stable as a slot until the moves, and the moves are
+ordered so no source (a register, or a memory source's base or index) is
+overwritten before it is read; a cycle parks one source in `%r11` or `%r10`,
+which are never promoted. Run time is neutral (store forwarding hid the round
+trips); frames shrink 16-48 bytes per function, which is stack per level of
+recursion.
+
+### Smaller things
+
+* `x * k` for `k` a power of two, 3, 5 or 9, or those times a power of two, is
+  a shift and/or one `lea`: two one-cycle steps for `x * 10` against three for
+  `imul`. A checked multiply recomputes its flags with its own `imul`.
+* A latch that switches on an integer with its target next falls into it
+  (`jne body`, not `je exit; jmp body`), and of two targets that both need a
+  jump the one in the deeper loop takes the conditional jump.
+
+### Tried and dropped
+
+* 32-byte instead of 16-byte alignment of loop bodies, against placement
+  effects: tuned 1.01, held-out 0.996.
+* Rotating a loop whose test sits behind a bounds check (`while a[i] < p`):
+  restricted to a loop's own exit test with a `goto` latch it measured
+  neutral (`sort` 0.99). Unrestricted it peeled loops round and round; that
+  made `heavy` 1.16x faster, a hint that unrolling small hot loops is worth a
+  real try.

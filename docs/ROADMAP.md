@@ -89,35 +89,39 @@ slot per element) removes the frame-size limit `check_frame_sizes` enforces.
 
 ## 4. Run-time code quality
 
-Measured on the held-out `real` set, where rmc's code is behind LLVM. Done in
-the second round (`AUDIT.md`, section 9): an interference-based register
-allocator with one priority order, arguments kept in their incoming
-registers, branch alignment off 32-byte boundaries, immediate shift counts,
-one-instruction element addressing through pointers, out-of-line bounds-check
-failure paths. Next, in expected order of payoff:
+Measured on the held-out `real` set, where rmc's code was behind LLVM. Done:
+an interference-based register allocator with one priority order, arguments
+kept in their incoming registers, branch alignment off 32-byte boundaries
+(second round, `AUDIT.md` section 9); live-range splitting around crowded
+loops, copy affinity, a register-level clean-up of each function (`asmopt`),
+range-based bounds-check elimination, scalar replacement of structs, correct
+loop depths (third round); selects for constant diamonds and the condition
+chains that feed them, a range test as one unsigned compare, store indices
+weighed for registers, parallel argument moves, precise call uses in
+`asmopt`, `lea` multiplies and latch layout (fourth round; `AUDIT.md` section
+10). Next, in expected order of
+payoff:
 
-* **live-range splitting**. With nine allocatable registers, a value live
-  through an inner loop it never touches (an outer counter) still holds its
-  register there. Splitting it around the loop (store before, reload after)
-  frees the register for the loop's temporaries. Re-weighting cannot do this:
-  three weightings were measured and each moved the loss between programs
-  (`design-notes.md`, "Register sharing").
+* **unrolling small hot loops**. A rotation experiment that accidentally
+  peeled `heavy`'s loop made it 1.16x faster; LLVM unrolls such loops.
+* **frame-pointer omission**. `%rbp` is the frame pointer, so a function with
+  calls has five callee-saved registers to LLVM's six; `nqueens` keeps three
+  call-crossing values in the frame.
+* **bounds checks from induction variables**. `fannkuch`'s and `sort`'s inner
+  loops keep two checks per iteration that a downward-counting index bounded
+  by an earlier check would remove.
 * **more allocatable registers**. `%r10`/`%r11` are scratch for division,
-  block copies and the return buffer, and several peepholes assume they are
-  free; freeing them per function needs those lowerings and the peepholes'
-  `SCRATCH` lists to agree.
-* **bounds-check elimination by range analysis**. A version that bounds
-  `(y & 127) * 128 + (x & 127)` and signed counters under `while x < N`
-  removed every check in `life`, but ran slower: the index lost its second use
-  and with it its register. It should land together with splitting; the
-  soundness half (stale facts) is already in.
-* if-conversion to `cmov` for data-dependent branches, with a heuristic that
-  keeps a predictable branch;
-* induction-variable strength reduction, generalising the single-pattern
-  `close_counted_loops`.
+  block copies and the cycle-breaking argument move, and several peepholes
+  assume they are free.
+* if-conversion to a conditional move for data-dependent branches with
+  non-constant arms needs profile data: `light` would gain and `heavy`, with
+  the same source shape and a predictable branch, would lose (LLVM picks the
+  move and runs `heavy` 1.5x slower than rmc).
 
 Judge every change on `real`, not only on `core`, with many interleaved
-repetitions: programs under ~5 ms move 5-15% with code placement alone.
+repetitions: programs under ~5 ms, and any change that only moves code, shift
+by a few percent with placement alone. A 32-byte loop alignment did not
+reduce that (tuned 1.01, held-out 0.996).
 
 ## 5. Compile time at scale
 

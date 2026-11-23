@@ -179,8 +179,8 @@ The tuned set overstates rmc's code quality: on held-out code the MIR back end
 is about half as fast as LLVM and slower than Cranelift. The causes measured
 in the generated code are register allocation (five callee-saved registers,
 loop-carried values in memory), no `cmov`, no induction-variable strength
-reduction, and per-iteration bounds checks. Section 9 is the round of work
-that followed, and its numbers.
+reduction, and per-iteration bounds checks. Sections 9 and 10 are the rounds
+of work that followed, and their numbers.
 
 ## 8. Coverage
 
@@ -271,6 +271,87 @@ measured and each moved the loss between programs; live-range splitting is the
 next step (`ROADMAP.md`, section 4). A range analysis that removes `life`'s
 bounds checks works but made `life` slower until then, because the index lost
 its second use and with it its register.
+
+## 10. Third and fourth rounds: closing the held-out gap
+
+Same method as section 9: the dumped MIR of every benchmark compiled by two
+`rmcmir` builds, min of 9 or more interleaved runs, both sets judged. All of
+it ran on one Intel Xeon (family 6 model 173). Programs under ~5 ms, and any
+change that only moves code, shift by a few percent with placement alone.
+
+### Third round: values that outlive what they are used for
+
+The held-out programs still far behind (`bfs`, `life`, `particles`) had more
+live values in their inner loops than the nine allocatable registers, and a
+value the inner loop never touched held a register through it.
+
+| change | what it fixes | effect, same MIR |
+|---|---|---|
+| `split_loop_ranges` (MIR) | a value live through a crowded loop it never mentions is copied to a fresh local before the loop and back at each exit, so it no longer competes inside | neutral alone; what the next rows build on |
+| copy affinity; a reborrow reads its pointer | `d = copy s` and `i as usize` may share a register; `&*p` no longer forces `p` into the frame | with the above |
+| `mir/asmopt.rs` | a register-level pass over each finished function: copy propagation, an address folded into the access, a value computed in a scratch register retargeted to its home, dead moves and loads removed, all on explicit liveness; it gives up on any line it does not model | held-out 1.09x (`particles` 1.27x, `fannkuch` 1.18x, `life` 1.15x) |
+| range-based bounds-check elimination | bounds from arithmetic (`x & 255`, `x % n`), from a passed loop test, from an earlier check of the same index, and through 64-bit casts | held-out 1.05x (`life` 1.35x, `vm` 1.10x) |
+| `scalarize_aggregates` (MIR) | a struct or tuple local used only field by field becomes one scalar per field | `particles` 1.44x |
+| loop depths; split placement | a two-deep nest gave every block depth 6, so outer-loop values outranked inner ones; locals now rank before hoisted constants; a split's copies sit next to their uses | held-out 1.04x (`textparse` 1.19x, `particles` 1.17x, `life` 1.16x) |
+
+Same MIR, start of the third round against its end: held-out set 0.70 ->
+0.87 of LLVM's speed, tuned set 1.14 -> 1.15 (`rmcmir` against the LLVM
+`-O3 -C lto=fat` binaries of the same sources, min of 7 interleaved runs).
+
+### Fourth round: branches, stores and calls
+
+| change | what it fixes | effect, same MIR |
+|---|---|---|
+| `select_diamonds` (MIR) | `x = if c { A } else { B }` on constants is arithmetic, not a branch that mispredicts on data | `bfs` 2.05x |
+| `fold_select_conditions` (MIR) | a short-circuit chain ending in such a select (`life`'s rule) folds into one condition first | `life` 1.17-1.21x |
+| store index weighting | the index of `a[i] = x` counted for nothing, so it never got a register | `sort` 1.15x, `life` 1.06x, `fannkuch` 1.04x |
+| parallel argument moves | every register-held argument went through a frame slot | frames 16-48 bytes smaller (stack per recursion level) |
+| multiply by a constant | `x * 10` is `lea` + `sal` (2 cycles) instead of `imul` (3) | `mandel` 1.09x, `textparse` 1.04x |
+| loop latch layout | a latch on an integer test was `je exit; jmp body` | `fannkuch` 1.03x, `nqueens` 1.03x |
+| `fold_range_checks` (MIR) | `lo <= x && x <= hi` is one unsigned compare of `x - lo` | `textparse` 1.03x |
+| precise call uses in `asmopt` | a call was taken to read all six argument registers and `%r10`/`%r11`, keeping dead copies alive | `life` 1.04x, `textparse` 1.02x, `hashmap` 1.02x |
+
+One defect in this round's own code was found in review after it was pushed:
+the condition fold could move `t += 1` out of `c || { t += 1; t > 5 }` when `t`
+was used nowhere else, so `t` also counted the iterations where `c`
+short-circuits. The fold now refuses statements that read a local they write
+(`tests/mir/selects`, `carried`, and a unit test; both fail without the fix).
+
+Kept as branches on purpose: `if x > K { x -= K }`. `light` would gain from a
+conditional move (its branch is random); `heavy` has the same shape with a
+predictable branch, where a conditional move would put the compare on the
+loop-carried chain. Without profile data the two cannot be told apart. LLVM
+picks the move (its `heavy` loop is unrolled twice with a `cmovl` on the sum),
+which is why it runs `heavy` 1.5x slower than rmc.
+
+### Where it stands
+
+From [`bench/RESULTS-4WAY.md`](../bench/RESULTS-4WAY.md), recorded at the end
+of the fourth round on the model 173 host (Intel Xeon @ 2.30 GHz): the same
+source through every pipeline, min of 7 builds and 30 interleaved runs.
+Geometric means of other / this, so above 1 favours the first pipeline:
+
+| rustc + rmc against LLVM | `core` (tuned) | `real` (held out) |
+|---|---:|---:|
+| compile wall time | 1.40 | 1.47 |
+| compile CPU time | 1.44 | 1.49 |
+| compiler peak memory | 1.13 | 1.11 |
+| binary size | 21.0 | 12.5 |
+| **run time** | **1.04** | **0.96** |
+| program peak memory | 1.23 | 1.14 |
+
+Run time of the other pipelines against LLVM: rustc + Cranelift 0.75 / 0.72,
+rmc's own front end 0.89 / 0.63 (it still keeps every array element in an
+8-byte slot). The held-out set moved from 0.69 at the end of the second round
+to 0.96. Per held-out program: `matmul` 1.16, `bfs` 1.11, `vm` 1.09, `life`
+1.02, `particles` 1.00, `hashmap` 0.99, `sort` 0.95, `fannkuch` 0.87,
+`nqueens` 0.81, `textparse` 0.72. The remaining losses have known causes:
+`textparse` keeps a bounds check per character and a zero-extension LLVM
+proves away; `nqueens` keeps three call-crossing values in the frame because
+`%rbp` stays the frame pointer; `fannkuch` keeps two bounds checks per swap
+that an induction-variable proof would remove. On the tuned set the only
+losses are the three runs under 5 ms (`fib` 0.95, `stats` 0.94, `light`
+0.92), where placement alone moves 5-15%.
 
 ## Reproducing
 

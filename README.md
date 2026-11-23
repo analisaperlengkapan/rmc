@@ -11,14 +11,14 @@ no assembler or linker process. It has two front ends sharing one back end:
 
 It is a research compiler. It is fast to build with and produces tiny
 binaries; it compiles a fraction of real Rust, and on code it was not tuned for
-its output runs at about two thirds of LLVM's speed, on par with Cranelift's. [`docs/AUDIT.md`](docs/AUDIT.md) has the
+its output runs at 0.96x LLVM's speed (Cranelift: 0.72x). [`docs/AUDIT.md`](docs/AUDIT.md) has the
 measured state and [`docs/ROADMAP.md`](docs/ROADMAP.md) the plan.
 
 ## Where it stands
 
-Measured on one Intel Xeon (2.1 GHz, family 6 model 207; raw tables in
-`bench/RESULTS-*.md`, method in `docs/AUDIT.md`). Every pipeline compiles the
-*same* source.
+Raw tables in `bench/RESULTS-*.md`, method in `docs/AUDIT.md`. Every pipeline
+compiles the *same* source. Build times are from an Intel Xeon @ 2.1 GHz
+(family 6 model 207), run times from an Intel Xeon @ 2.3 GHz (model 173).
 
 **Build time** (one build, generated programs; [`RESULTS-SCALE.md`](bench/RESULTS-SCALE.md)):
 
@@ -35,21 +35,23 @@ faster than LLVM -O3 only on large programs and about 2.5x slower than
 Cranelift or LLVM -O0, because its back end works on assembly text.
 
 **Run time** (geometric mean of LLVM time / pipeline time, so below 1 is
-slower than LLVM; [`RESULTS-4WAY.md`](bench/RESULTS-4WAY.md)):
+slower than LLVM; [`RESULTS-4WAY.md`](bench/RESULTS-4WAY.md), Intel Xeon @ 2.30 GHz, family 6 model 173):
 
 | | 12 programs rmc was tuned on | 10 held-out realistic programs |
 |---|---:|---:|
-| rustc + rmc back end | 1.13 | **0.69** |
-| rmc front end + back end | 0.97 | 0.63 |
-| rustc + Cranelift | 0.81 | 0.71 |
+| rustc + rmc back end | 1.04 | **0.96** |
+| rmc front end + back end | 0.89 | 0.63 |
+| rustc + Cranelift | 0.75 | 0.72 |
 
-On the programs it was tuned for, rmc's code matches LLVM's and beats
-Cranelift's (the tuned geometric mean includes `forloops`, where LLVM is 2.5x
-slower; without it the MIR back end is at about 1.05). On held-out code the
-MIR back end runs at 0.69x LLVM, up from 0.52x before its second round of
-work, and at 0.97x Cranelift: register pressure in loops with many live values
-(`bfs`, `life`, `particles` at about 0.5x) is the remaining gap
-(`docs/AUDIT.md`, section 9).
+On held-out code the MIR back end went from 0.52x LLVM before this work to
+0.69x after its second round of run-time work and 0.96x after the third
+and fourth (`docs/AUDIT.md`, sections 9 and 10). Per held-out program: `matmul` 1.16,
+`bfs` 1.11, `vm` 1.09, `life` 1.02, `particles` 1.00, `hashmap` 0.99, `sort`
+0.95, `fannkuch` 0.87, `nqueens` 0.81, `textparse` 0.72. On the tuned set
+`heavy` is 1.57 (LLVM uses a conditional move on its loop-carried sum) and the
+three programs under 5 ms (`fib` 0.95, `stats` 0.94, `light` 0.92) are the
+only losses. Every other axis (build time and CPU, compiler memory, binary
+size, program memory) favours the rustc + rmc route on both sets.
 
 **Binary size**: a few hundred bytes to a few kB, against ~17 kB for the same
 `no_std` program through LLVM (the runtime keeps only the pieces a program
@@ -168,10 +170,10 @@ percent between runs and hosts.
 * Language: the subset in `docs/language.md` for rmc's front end; for the rustc
   route, what the local crate's MIR can express without generic `std` code (no
   `Vec`, iterator adapters, closures as values, `dyn Trait`, `env::args`).
-* Code quality: the register allocator shares registers by interference but
-  does not split live ranges, and only nine registers are allocatable; no
-  `cmov`, no induction-variable strength reduction. Held-out code runs at
-  about two thirds of LLVM's speed.
+* Code quality: nine allocatable registers and an always-kept frame pointer;
+  no loop unrolling, no conditional moves for branches with non-constant
+  arms, no induction-variable strength reduction. Held-out code runs at
+  0.96x LLVM's speed (`docs/ROADMAP.md`, section 4).
 * rmc's own front end treats `u64`/`usize` as `i64` (`docs/language.md`), so a
   comparison or division of values at or above 2^63 differs from rustc.
 * rmc's front end stores each array element in an 8-byte slot, so a large local

@@ -83,7 +83,8 @@ change is done when every suite passes on the pinned nightly *and* on stable
 |---|---|
 | `RMC_SKIP_MIR_PASSES=a,b` | skip named MIR passes (names: `lib.rs::optimize_mir`) |
 | `RMC_SKIP_PEEPHOLE=a,b` | skip named assembly peepholes (`mir/codegen.rs::optimize`) |
-| `RMC_TRACE_PEEPHOLE=1` | print every peephole pass that changed a function |
+| `RMC_TRACE_PEEPHOLE=1` | print every peephole pass that changed a function, and why asmopt gave up on one |
+| `RMC_TRACE_ALLOC=1` | every register candidate in priority order, where it went, and what blocked it |
 | `RMC_TIME=1` | per-pass and per-phase timings (MIR route, `rmcmir`) |
 | `--no-inline`, `--no-licm`, `--no-tco` | disable a pass on either route |
 | `--keep-mir`, `--emit-asm`, `--binutils`, `--no-strip` | inspect intermediate output |
@@ -189,7 +190,8 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
 * **One pass pipeline**: `lib.rs::optimize_mir` is called by the CLI, the dylib
   and `rmcmir`. Never copy the pass list.
 * **A destination place reads locals** (`(*_p)[i] = x` reads `_p` and `i`);
-  every use/def analysis must count them (`count_place_reads`).
+  every use/def analysis must count them (`count_place_reads`), and so must
+  the promotion weights.
 * **Split assembly operands with `split_ops`** (last comma outside
   parentheses), never at the first comma: scaled-index addresses carry commas.
 * A peephole that replaces an instruction with `lea` must check
@@ -213,6 +215,23 @@ The bold phrase is greppable in `docs/design-notes.md` for the full reasoning.
 * **A dropped assertion rests only on facts that still hold**: a call kills
   its destination, no fact is kept about an address-taken local, and a folded
   overflow check keeps its comparisons when another block reads them.
+* **`split_loop_ranges` is an identity**: a save follows the entry block's
+  last mention of its value, a restore precedes the exit's first mention, and
+  a new edge block joins every enclosing loop.
+* **asmopt runs once, after every text peephole**, never before one, and
+  leaves a function untouched when it meets a line it does not model. It
+  trusts a call's `#argregs N` note (written by `gen_call`) for which argument
+  registers the call reads; an undercount deletes an argument's setup.
+* **Speculated statements must be speculatable**: a select or a folded
+  condition moves only register arithmetic and comparisons (no deref, no
+  computed index, no `/` or `%`) that define locals nothing else reads and
+  that the moved code does not read before writing (a value carried between
+  runs, `c || { t += 1; t > 5 }`), and a condition chain is folded only when
+  it ends in constant arms.
+* **`fold_range_checks` runs after `drop_redundant_asserts`**, which reads
+  bounds off the original tests.
+* **Call arguments are one parallel assignment**: operand evaluation writes
+  only `SCRATCH_REGS`; a cycle goes through `%r11`/`%r10`, never promoted.
 * The dylib links one exact nightly (`backend/rust-toolchain.toml`); every
   harness reads the pin from there. Panic stubs are derived from `nm -u`, never
   hard-coded mangled names.
