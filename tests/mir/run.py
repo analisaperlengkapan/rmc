@@ -50,6 +50,8 @@ ARGS = {
     # The split must not sink `x = 2` below a read or write through a pointer
     # to `x`; zero, one and several loop trips.
     "splitptr": [["7", "0"], ["7", "1"], ["-3", "5"]],
+    # An address-taken local read through a pointer across a split loop.
+    "splitescaped": [["7", "0"], ["7", "1"], ["-3", "5"]],
     # Mixed-width tuples in arrays: the written element equal to, before and
     # after the read one, and the last element (whose `.1` ends the array).
     "tupleelem": [["1", "2"], ["2", "2"], ["3", "6"], ["6", "6"], ["0", "4"], ["4", "4"]],

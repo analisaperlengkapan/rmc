@@ -5956,6 +5956,46 @@ fn rvalue_mentions(rv: &Rvalue, out: &mut HashSet<u32>) {
     }
 }
 
+/// Whether `p` is addressed through a pointer (`*p`, `(*p).f`, `p[i]`).
+fn place_has_deref(p: &Place) -> bool {
+    p.proj.iter().any(|pr| matches!(pr, Proj::Deref))
+}
+
+/// Whether `s` reads or writes memory through a pointer, or takes an address: a
+/// place with a `Deref` projection, or a `Ref`/`RawRef` rvalue. A constant
+/// assignment commutes with these only under memory-dependence analysis, so the
+/// loop splitter leaves it where it is.
+fn stmt_touches_pointer(s: &Stmt) -> bool {
+    fn operand(o: &Operand) -> bool {
+        match o {
+            Operand::Copy(p) | Operand::Move(p) => place_has_deref(p),
+            Operand::Const(c) => const_agg(c),
+            Operand::Fn(_) | Operand::Fmt { .. } => false,
+        }
+    }
+    fn const_agg(c: &Const) -> bool {
+        match c {
+            Const::Alloc { place: Some(p), .. } => place_has_deref(p),
+            Const::Agg { ops, .. } => ops.iter().any(operand),
+            _ => false,
+        }
+    }
+    fn rvalue(rv: &Rvalue) -> bool {
+        match rv {
+            Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::Cast { op: o, .. } | Rvalue::Repeat { op: o, .. } => operand(o),
+            Rvalue::Binary(_, a, b) | Rvalue::WithOverflow { a, b, .. } => operand(a) || operand(b),
+            Rvalue::Ref { .. } | Rvalue::RawRef { .. } => true,
+            Rvalue::Len(p) | Rvalue::Discriminant(p) => place_has_deref(p),
+            Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => ops.iter().any(operand),
+            Rvalue::Unsupported(_) => true,
+        }
+    }
+    match s {
+        Stmt::Assign(p, rv) => place_has_deref(p) || rvalue(rv),
+        Stmt::Nop => false,
+    }
+}
+
 /// Every local a terminator mentions, read or written.
 fn term_mentions(t: &Terminator, out: &mut HashSet<u32>) {
     match t {
@@ -6274,6 +6314,14 @@ impl Function {
                             // (`*p`), so the statements in between are not
                             // known to leave it alone: it stays where it is.
                             if escaped.contains(&x) {
+                                continue;
+                            }
+                            // Even a local whose address was not taken may be
+                            // reached by a pointer the analysis cannot track
+                            // (one built from an integer, say), and a `Ref`
+                            // changes what a later `Deref` sees. Keep the
+                            // assignment above any such statement.
+                            if stmts[i + 1..=last].iter().any(stmt_touches_pointer) {
                                 continue;
                             }
                             let mentioned = stmts[i + 1..=last].iter().any(|y| {
