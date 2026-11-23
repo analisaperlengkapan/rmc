@@ -1,0 +1,73 @@
+#![no_std]
+#![no_main]
+include!("prelude.rs");
+
+// A tuple of mixed widths has one layout for its constant, field addressing,
+// element stride and copy length. `(u8, i64)` put its second field at byte 8 but
+// measured 9 bytes: in an array every element's `.1` overlapped the next
+// element, and `[E; 7]` copied the constant one byte into each field. `(u8, u8)`
+// measured 8 with its second field at byte 8. The constants differ in every
+// byte (`0x1234_5678_9ABC`), so a field that keeps only some of its bytes, or
+// borrows them from a neighbour, cannot match rustc by coincidence (`900` is
+// `0x384`, whose high byte is the `3` of `(3, 900)`).
+//
+// Reads use runtime indices after a runtime write to a different element, so
+// rustc cannot fold them through the array.
+
+const E: (u8, i64) = (5, 0x1234_5678_9ABC);
+const F: (u8, u8) = (7, 9);
+
+#[inline(never)]
+fn wide(k: i64, i: usize) -> i64 {
+    let mut a = [E; 7];
+    a[(k as usize) % 7].1 = 901;
+    a[i % 7].1 + a[(i + 1) % 7].0 as i64
+}
+
+#[inline(never)]
+fn narrow(k: i64, i: usize) -> i64 {
+    let mut a = [F; 5];
+    a[(k as usize) % 5].1 = 100;
+    let s = a[i % 5].0 as i64 * 1000 + a[i % 5].1 as i64;
+    s + a[(i + 1) % 5].1 as i64 * 7
+}
+
+struct G {
+    v: i64,
+}
+impl Drop for G {
+    fn drop(&mut self) {
+        out(self.v);
+    }
+}
+
+// A droppable field after a narrow one: the glue finds it where the tuple
+// keeps it, not one byte in.
+#[inline(never)]
+fn dropped(k: i64) {
+    let t = (k as u8, G { v: k + 40 });
+    out(t.0 as i64);
+}
+
+#[inline(never)]
+fn consume(t: (u8, G)) {
+    out(t.0 as i64);
+}
+
+#[inline(never)]
+fn dropped_arr(k: i64) {
+    let a = [(k as u8, G { v: k + 50 }), (k as u8 + 1, G { v: k + 60 })];
+    out(a[0].0 as i64 + a[1].0 as i64);
+}
+
+#[no_mangle]
+pub extern "C" fn main() -> i64 {
+    let k = arg(1);
+    let i = arg(2) as usize;
+    out(wide(k, i));
+    out(narrow(k, i));
+    dropped(k);
+    consume((k as u8, G { v: k + 45 }));
+    dropped_arr(k);
+    0
+}

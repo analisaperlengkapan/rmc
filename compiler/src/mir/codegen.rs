@@ -3468,12 +3468,10 @@ impl<'a> FnGen<'a> {
     /// cannot change the offsets of equal-sized fields).
     fn field_offset(&self, ty: &Ty, k: u64) -> i64 {
         match ty {
-            Ty::Tuple(tys) => tys
-                .iter()
-                .take(k as usize)
-                .map(|t| self.size_of_ty(t))
-                .sum::<i64>()
-                .max(8 * k as i64),
+            Ty::Tuple(tys) => {
+                let tys: Vec<&Ty> = tys.iter().map(|t| &**t).collect();
+                self.tuple_layout(&tys).0.get(k as usize).copied().unwrap_or(8 * k as i64)
+            }
             Ty::Struct(name) => self.struct_layout(name).map(|(offs, _)| offs.get(k as usize).copied().unwrap_or(k as i64 * 8)).unwrap_or(k as i64 * 8),
             _ => k as i64 * 8,
         }
@@ -3488,6 +3486,28 @@ impl<'a> FnGen<'a> {
                 .unwrap_or(Ty::I64),
             _ => Ty::I64,
         }
+    }
+
+    /// The field offsets and the size of a tuple of `tys`: one layout for the
+    /// constant's materialisation, field addressing, element stride and copy
+    /// length.
+    ///
+    /// A field starts where the previous one ends, but never below word `k`,
+    /// because a tuple constant is written one word per field
+    /// (`const_agg_layout`) and must land where a declared `(u8, i64)` reads its
+    /// second field. The size runs to the end of the last field. It used to be
+    /// the sum of the field sizes, 9 for `(u8, i64)` with the `i64` at byte 8, so
+    /// in `[(u8, i64); N]` every element's second field overlapped the next
+    /// element and a copy of one element stopped a byte into it.
+    fn tuple_layout(&self, tys: &[&Ty]) -> (Vec<i64>, i64) {
+        let mut offs = Vec::with_capacity(tys.len());
+        let mut end = 0i64;
+        for (k, t) in tys.iter().enumerate() {
+            let off = end.max(8 * k as i64);
+            offs.push(off);
+            end = off + self.size_of_ty(t);
+        }
+        (offs, end.max(8))
     }
 
     /// Byte size of a type as the backend lays it out. A struct is the sum of
@@ -3515,7 +3535,10 @@ impl<'a> FnGen<'a> {
                     .max(8)
             }
             Ty::Array(elem, n) => self.size_of_ty(elem) * (*n as i64).max(1),
-            Ty::Tuple(tys) => tys.iter().map(|t| self.size_of_ty(t)).sum::<i64>().max(8),
+            Ty::Tuple(tys) => {
+                let tys: Vec<&Ty> = tys.iter().map(|t| &**t).collect();
+                self.tuple_layout(&tys).1
+            }
             _ => 8,
         }
     }
@@ -3681,13 +3704,9 @@ impl<'a> FnGen<'a> {
             // A tuple or array constant is printed without a name; lay its
             // fields out by their real sizes, as the struct branch does.
             let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(&self.func, op)).collect();
-            let mut offs = Vec::new();
-            let mut acc = 0i64;
-            for t in &tys {
-                offs.push(acc);
-                acc += self.size_of_ty(t);
-            }
-            Ok((offs, tys, acc.max(8), None))
+            let refs: Vec<&Ty> = tys.iter().collect();
+            let (offs, size) = self.tuple_layout(&refs);
+            Ok((offs, tys, size, None))
         } else {
             let key = struct_path_name(name).unwrap_or_else(|| name.clone());
             let tys = self.structs.get(&key).cloned().unwrap_or_default();
@@ -5256,8 +5275,12 @@ impl<'a> FnGen<'a> {
             Ty::Struct(_) | Ty::Tuple(_) => {
                 // No droppable field: the own impl (already emitted) is all.
                 let Some(ptr) = ptr else { return Ok(()) };
-                let mut off = 0i64;
-                for fty in fields.iter() {
+                let mut packed = 0i64;
+                for (k, fty) in fields.iter().enumerate() {
+                    let off = match ty {
+                        Ty::Tuple(_) => self.field_offset(ty, k as u64),
+                        _ => packed,
+                    };
                     if self.ty_needs_drop(fty) {
                         self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
                         if off != 0 {
@@ -5265,7 +5288,7 @@ impl<'a> FnGen<'a> {
                         }
                         self.gen_drop_glue_at_reg(fty)?;
                     }
-                    off += self.size_of_ty(fty);
+                    packed += self.size_of_ty(fty);
                 }
             }
             _ => {}
