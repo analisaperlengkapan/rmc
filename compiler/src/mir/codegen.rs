@@ -3465,7 +3465,7 @@ impl<'a> FnGen<'a> {
             }
             Ty::Array(elem, n) => {
                 let (es, ea) = self.rustc_layout(elem)?;
-                Some((es * (*n as i64).max(1), ea))
+                Some((es * *n as i64, ea))
             }
             Ty::Tuple(tys) => {
                 let (mut off, mut align) = (0i64, 1i64);

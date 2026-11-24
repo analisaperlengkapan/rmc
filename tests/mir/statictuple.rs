@@ -13,6 +13,10 @@ static A: [([u8; 8], u8); 3] = [([1; 8], 11), ([2; 8], 22), ([3; 8], 33)];
 // element; the back end's word-per-field layout puts the second at 8.
 static B: [(u8, u8); 3] = [(1, 11), (2, 22), (3, 33)];
 
+// A zero-length array is a zero-sized field: rustc's `([i64; 0], u8)` is 8
+// bytes (the `u8` at 0), not 16.
+static Z: [([i64; 0], u8); 3] = [([], 1), ([], 2), ([], 3)];
+
 // rustc reorders struct fields by alignment: `b` (i64) comes first and `a`
 // (u8) sits at byte 8, though the declaration order is the other way round.
 // `take` keeps a real `S` aggregate in the body, so the back end learns its
@@ -40,6 +44,7 @@ pub extern "C" fn main() -> i64 {
     out(A[k].0[7] as i64);
     out(B[k].1 as i64);
     out(B[k].0 as i64);
+    out(Z[k].1 as i64);
     out(take(S { a: k as u8 + 40, b: k as i64 + 50 }));
     out(D[k].a as i64);
     out(D[k].b);
