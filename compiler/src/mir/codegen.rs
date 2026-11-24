@@ -87,6 +87,11 @@ struct FnGen<'a> {
     template_ids: &'a HashMap<Vec<u8>, String>,
     /// Static allocation id -> its data label.
     alloc_labels: &'a HashMap<u32, String>,
+    /// Local -> the `static` allocation whose address it holds, when every
+    /// whole-local write of the local is that address (or a copy of another
+    /// such local). A place reached through it must use rustc's layout, because
+    /// the bytes come from the MIR dump.
+    static_bases: HashMap<u32, u32>,
     /// Struct name -> field types, learned from aggregate constructions. Used to
     /// size a struct and to stride over an array of them.
     structs: &'a HashMap<String, Vec<Ty>>,
@@ -1208,6 +1213,82 @@ fn rv_operand_ty(f: &Function, op: &Operand) -> Ty {
     }
 }
 
+/// Locals that hold a `static`'s address for their whole life. The MIR dump
+/// writes the static's bytes with rustc's layout, so a place reached through
+/// one of these must not be addressed with the back end's tuple layout. A local
+/// qualifies only when every whole-local write is the address of the same
+/// `static`, or a copy of a local that does; a call result or any other write
+/// disqualifies it, so the answer is the same at every use.
+fn collect_static_bases(prog: &Program, func: &Function) -> HashMap<u32, u32> {
+    enum Source {
+        Alloc(u32),
+        Copy(u32),
+        Other,
+    }
+    let mut sources: HashMap<u32, Vec<Source>> = HashMap::new();
+    for b in &func.blocks {
+        for s in &b.stmts {
+            match s {
+                Stmt::Assign(p, Rvalue::Use(op)) if p.proj.is_empty() => {
+                    let src = match op {
+                        Operand::Const(Const::Alloc { id, place: None })
+                            if prog.allocs.get(id).is_some_and(|a| a.static_name.is_some()) =>
+                        {
+                            Source::Alloc(*id)
+                        }
+                        Operand::Copy(q) | Operand::Move(q) if q.proj.is_empty() => {
+                            Source::Copy(q.local)
+                        }
+                        _ => Source::Other,
+                    };
+                    sources.entry(p.local).or_default().push(src);
+                }
+                Stmt::Assign(p, _) => sources.entry(p.local).or_default().push(Source::Other),
+                Stmt::Nop => {}
+            }
+        }
+        if let Terminator::Call { dest, .. } = &b.term {
+            if dest.proj.is_empty() {
+                sources.entry(dest.local).or_default().push(Source::Other);
+            }
+        }
+    }
+    let mut out: HashMap<u32, u32> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for (&l, srcs) in &sources {
+            if out.contains_key(&l) {
+                continue;
+            }
+            let mut id = None;
+            let mut ok = true;
+            for s in srcs {
+                let this = match s {
+                    Source::Alloc(a) => Some(*a),
+                    Source::Copy(c) => out.get(c).copied(),
+                    Source::Other => None,
+                };
+                match (id, this) {
+                    (None, Some(a)) => id = Some(a),
+                    (Some(a), Some(b)) if a == b => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if let (true, Some(a)) = (ok, id) {
+                out.insert(l, a);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
+}
+
 fn collect_strings_rv(rv: &Rvalue, order: &mut Vec<String>, map: &mut HashMap<String, String>) {
     let mut add = |c: &Const| {
         if let Const::Str(s) = c {
@@ -1257,6 +1338,15 @@ fn collect_strings_rv(rv: &Rvalue, order: &mut Vec<String>, map: &mut HashMap<St
     }
 }
 
+/// Round `n` up to the next multiple of `a` (`a >= 1`).
+fn align_up(n: i64, a: i64) -> i64 {
+    if a <= 1 {
+        n
+    } else {
+        (n + a - 1) / a * a
+    }
+}
+
 impl<'a> FnGen<'a> {
     fn new(
         prog: &'a Program,
@@ -1268,6 +1358,7 @@ impl<'a> FnGen<'a> {
         structs: &'a HashMap<String, Vec<Ty>>,
         enums: &'a HashMap<String, EnumLayout>,
     ) -> Self {
+        let static_bases = collect_static_bases(prog, func);
         FnGen {
             prog,
             func,
@@ -1275,6 +1366,7 @@ impl<'a> FnGen<'a> {
             string_ids,
             template_ids,
             alloc_labels,
+            static_bases,
             structs,
             enums,
             size: Vec::new(),
@@ -3239,7 +3331,7 @@ impl<'a> FnGen<'a> {
     /// would be invisible to them and the stores that initialise the array
     /// would be dropped as unread.
     fn mem_plan(&self, p: &Place) -> Option<MemPlan> {
-        if p.proj.is_empty() {
+        if p.proj.is_empty() || self.static_bases.contains_key(&p.local) {
             return None;
         }
         let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
@@ -3358,8 +3450,186 @@ impl<'a> FnGen<'a> {
         Ok("(%rax)".to_string())
     }
 
+    /// Byte size and alignment of `ty` in rustc's layout. A `static`'s bytes
+    /// come from the MIR dump, so an interior address must agree with this, not
+    /// with `size_of_ty` (which pads a tuple to whole words). `None` for a type
+    /// whose rustc layout the back end does not model.
+    fn rustc_layout(&self, ty: &Ty) -> Option<(i64, i64)> {
+        match ty {
+            Ty::Unit => Some((0, 1)),
+            Ty::Bool | Ty::U8 | Ty::Int { width: 1, .. } => Some((1, 1)),
+            Ty::Int { width: 2, .. } => Some((2, 2)),
+            Ty::Int { width: 4, .. } | Ty::F32 => Some((4, 4)),
+            Ty::I64 | Ty::Int { width: 8, .. } | Ty::F64 | Ty::Ptr(_) | Ty::Ref(_) => {
+                Some((8, 8))
+            }
+            Ty::Array(elem, n) => {
+                let (es, ea) = self.rustc_layout(elem)?;
+                Some((es * (*n as i64).max(1), ea))
+            }
+            Ty::Tuple(tys) => {
+                let (mut off, mut align) = (0i64, 1i64);
+                for t in tys {
+                    let (s, a) = self.rustc_layout(t)?;
+                    off = align_up(off, a) + s;
+                    align = align.max(a);
+                }
+                Some((align_up(off, align), align))
+            }
+            Ty::Struct(name) => {
+                let fields = self.structs.get(name)?;
+                let (_, size, align) = self.rustc_struct_fields(fields)?;
+                Some((size, align))
+            }
+            Ty::Int { .. } | Ty::Other => None,
+        }
+    }
+
+    /// The declaration-order field offsets, size and alignment of a struct in
+    /// rustc's layout. Unlike a tuple, rustc reorders struct fields by
+    /// decreasing alignment (stable for ties) to minimise padding, so the
+    /// offsets cannot be summed in declaration order.
+    fn rustc_struct_fields(&self, fields: &[Ty]) -> Option<(Vec<i64>, i64, i64)> {
+        let mut keyed: Vec<(usize, bool, i64)> = Vec::with_capacity(fields.len());
+        for (i, t) in fields.iter().enumerate() {
+            let (s, a) = self.rustc_layout(t)?;
+            keyed.push((i, s == 0, a));
+        }
+        keyed.sort_by_key(|&(_, zst, a)| (zst, std::cmp::Reverse(a)));
+        let mut offs = vec![0i64; fields.len()];
+        let (mut off, mut align) = (0i64, 1i64);
+        for (i, _, _) in keyed {
+            let (s, a) = self.rustc_layout(&fields[i])?;
+            off = align_up(off, a);
+            offs[i] = off;
+            off += s;
+            align = align.max(a);
+        }
+        Some((offs, align_up(off, align), align))
+    }
+
+    fn rustc_size(&self, ty: &Ty) -> Option<i64> {
+        self.rustc_layout(ty).map(|(s, _)| s)
+    }
+
+    /// The offset of field `k` in rustc's layout, for a tuple or struct.
+    fn rustc_field_offset(&self, ty: &Ty, k: u64) -> Option<i64> {
+        match ty {
+            Ty::Tuple(tys) => {
+                let mut off = 0i64;
+                for (i, t) in tys.iter().enumerate() {
+                    let (s, a) = self.rustc_layout(t)?;
+                    off = align_up(off, a);
+                    if i as u64 == k {
+                        return Some(off);
+                    }
+                    off += s;
+                }
+                None
+            }
+            Ty::Struct(name) => self
+                .structs
+                .get(name)
+                .and_then(|f| self.rustc_struct_fields(f))
+                .and_then(|(offs, _, _)| offs.get(k as usize).copied()),
+            _ => None,
+        }
+    }
+
+    /// Address a place whose base local holds a `static`'s address. The static
+    /// data is rustc's, so every stride and field offset is rustc's. A type the
+    /// back end cannot lay out, or an allocation whose rustc size disagrees with
+    /// the computed one, is refused rather than misread.
+    fn place_addr_static(&mut self, p: &Place, id: u32, mut ty: Ty) -> Result<(), String> {
+        let name = self
+            .prog
+            .allocs
+            .get(&id)
+            .and_then(|a| a.static_name.clone())
+            .unwrap_or_else(|| format!("alloc{id}"));
+        let size = self.rustc_layout(&ty).map(|(s, _)| s).ok_or_else(|| {
+            format!("mir_codegen: static `{name}` has a type the back end does not lay out: {ty:?}")
+        })?;
+        let actual = self.prog.allocs.get(&id).map_or(0, |a| a.size);
+        if actual != 0 && actual != size {
+            return Err(format!(
+                "mir_codegen: static `{name}` is {actual} bytes in rustc's layout but {size} in the back end's; refusing to address it"
+            ));
+        }
+        let src = self.local_operand(p.local);
+        self.emit(&format!("  mov {src}, %rax"));
+        for proj in &p.proj[1..] {
+            match proj {
+                Proj::Field(k) => {
+                    let off = self.rustc_field_offset(&ty, *k as u64).ok_or_else(|| {
+                        format!("mir_codegen: static `{name}`: field {k} of {ty:?} is not laid out")
+                    })?;
+                    self.emit(&format!("  add ${off}, %rax"));
+                    ty = self.field_ty(&ty, *k as u64);
+                }
+                Proj::IndexConst(i) => {
+                    let elem = elem_ty(&ty);
+                    let stride = self.rustc_size(&elem).ok_or_else(|| {
+                        format!("mir_codegen: static `{name}`: element of {ty:?} is not laid out")
+                    })?;
+                    self.emit(&format!("  add ${}, %rax", *i as i64 * stride + slice_header(&ty)));
+                    ty = elem;
+                }
+                Proj::IndexLocal(l) => {
+                    let elem = elem_ty(&ty);
+                    let stride = self.rustc_size(&elem).ok_or_else(|| {
+                        format!("mir_codegen: static `{name}`: element of {ty:?} is not laid out")
+                    })?;
+                    let src = self.local_operand(*l);
+                    self.emit(&format!("  mov {src}, %rcx"));
+                    match stride {
+                        1 => self.emit("  add %rcx, %rax"),
+                        2 => self.emit("  lea (%rax,%rcx,2), %rax"),
+                        4 => self.emit("  lea (%rax,%rcx,4), %rax"),
+                        8 => self.emit("  lea (%rax,%rcx,8), %rax"),
+                        s => {
+                            self.emit(&format!("  imul ${s}, %rcx, %rcx"));
+                            self.emit("  add %rcx, %rax");
+                        }
+                    }
+                    let header = slice_header(&ty);
+                    if header != 0 {
+                        self.emit(&format!("  add ${header}, %rax"));
+                    }
+                    ty = elem;
+                }
+                Proj::RawRef => {}
+                Proj::Deref => {
+                    return Err(format!(
+                        "mir_codegen: static `{name}`: a pointer field is not modelled"
+                    ));
+                }
+                Proj::Variant(_) => {
+                    return Err(format!(
+                        "mir_codegen: static `{name}`: an enum variant is not modelled"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn place_addr(&mut self, p: &Place) -> Result<(), String> {
         let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
+        if starts_deref {
+            if let Some(id) = self.static_bases.get(&p.local).copied() {
+                let ty = match self.local_ty(p.local) {
+                    Ty::Ref(t) | Ty::Ptr(t) => (*t).clone(),
+                    _ => {
+                        return Err(format!(
+                            "mir_codegen: static base `_{}` is not a reference",
+                            p.local
+                        ))
+                    }
+                };
+                return self.place_addr_static(p, id, ty);
+            }
+        }
         // An aggregate argument is passed by address: its frame slot holds a
         // pointer to the value, not the value itself (see `gen_call`, which
         // evaluates every aggregate argument to an address). Every read of such

@@ -54,6 +54,8 @@ ARGS = {
     "splitescaped": [["7", "0"], ["7", "1"], ["-3", "5"]],
     # A narrow signed wrap must keep its bounds check (both shapes panic).
     "narrowwrap": [["127"], ["1"], ["-127"], ["0"]],
+    # Static tuple arrays keep rustc's packed element stride.
+    "statictuple": [["1"], ["2"], ["0"]],
     # Mixed-width tuples in arrays: the written element equal to, before and
     # after the read one, and the last element (whose `.1` ends the array).
     "tupleelem": [["1", "2"], ["2", "2"], ["3", "6"], ["6", "6"], ["0", "4"], ["4", "4"]],

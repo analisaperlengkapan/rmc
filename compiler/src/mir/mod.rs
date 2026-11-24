@@ -397,6 +397,10 @@ pub struct AllocData {
     pub relocs: Vec<(usize, u32)>,
     /// The `static NAME` this allocation initialises, if any.
     pub static_name: Option<String>,
+    /// The allocation's size in bytes, as rustc laid it out. The bytes are
+    /// rustc's, so an interior address must use rustc's strides and offsets,
+    /// not the back end's word-per-field tuple layout.
+    pub size: i64,
 }
 
 impl Program {
@@ -1429,7 +1433,12 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
         .split_once("static:")
         .and_then(|(_, r)| r.split(',').next())
         .map(|n| n.trim().to_string());
-    let mut data = AllocData { bytes: Vec::new(), relocs: Vec::new(), static_name };
+    let size = header
+        .split_once("size:")
+        .and_then(|(_, r)| r.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let mut data = AllocData { bytes: Vec::new(), relocs: Vec::new(), static_name, size };
     // A zero-sized alloc is printed on one line, `allocN (..) {}`.
     if header.ends_with("{}") {
         return Ok((id, data, start + 1));
@@ -1438,6 +1447,9 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
     while i < lines.len() {
         let l = lines[i].trim();
         if l.starts_with('}') {
+            if data.size > 0 && (data.bytes.len() as i64) < data.size {
+                data.bytes.resize(data.size as usize, 0);
+            }
             return Ok((id, data, i + 1));
         }
         // The dump is a table split by the box-drawing `│`. Two shapes appear:
@@ -1452,8 +1464,11 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
             fields[0]
         };
         for tok in data_field.split_whitespace() {
-            // A `__` marks padding past the initialised bytes, not a byte.
+            // A `__` marks a padding byte. It is part of the allocation (the
+            // next field's offset depends on it), so it must occupy a zero in
+            // the blob; dropping it packed the fields together.
             if tok == "__" {
+                data.bytes.push(0);
                 continue;
             }
             if tok.contains("alloc") && tok.contains("<imm>") {
