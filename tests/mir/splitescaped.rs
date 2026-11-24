@@ -29,10 +29,30 @@ fn through_pointer(a: i64, b: i64, c: i64, d: i64, param: i64, n: i64) -> i64 {
     v + a + b + c + d
 }
 
+#[inline(never)]
+fn taken_after(a: i64, b: i64, c: i64, d: i64, param: i64, n: i64) -> i64 {
+    let mut x = 0i64;
+    x = 5;
+    let p = core::hint::black_box(&mut x as *mut i64);
+    let mut i = 0i64;
+    let mut v = 0i64;
+    while i < n {
+        v = unsafe { *p } + param;
+        let mut j = 0i64;
+        while j < n {
+            core::hint::black_box(j);
+            j += 1;
+        }
+        i += 1;
+    }
+    v + a + b + c + d
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
     let n = arg(2);
     out(through_pointer(k, k + 1, k + 2, k + 3, k * 5, n));
+    out(taken_after(k, k + 1, k + 2, k + 3, k * 5, n));
     0
 }
