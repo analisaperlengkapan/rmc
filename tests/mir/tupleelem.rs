@@ -72,11 +72,30 @@ fn repeated(k: i64, i: usize) -> i64 {
     a[i % 4].1 + a[(i + 1) % 4].0 as i64
 }
 
+// The other field orders: `(i64, u8)` keeps `.0` in the first word and `.1`
+// in the second, and `(u8, u8)` keeps both bytes at 0 and 8 of its 16-byte
+// slot. A copy shorter than the slot drops the second field.
+#[inline(never)]
+fn repeated_i64_u8(k: i64, i: usize) -> i64 {
+    let mut a = [(0x1122334455667788i64, 0x9Au8); 4];
+    a[(k as usize) % 4].0 = 7;
+    a[i % 4].0 + a[(i + 1) % 4].1 as i64
+}
+
+#[inline(never)]
+fn repeated_u8_u8(k: i64, i: usize) -> i64 {
+    let mut a = [(0xABu8, 0xCDu8); 4];
+    a[(k as usize) % 4].1 = 0x11;
+    a[i % 4].1 as i64 * 1000 + a[(i + 1) % 4].0 as i64
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
     let i = arg(2) as usize;
     out(repeated(k, i));
+    out(repeated_i64_u8(k, i));
+    out(repeated_u8_u8(k, i));
     out(wide(k, i));
     out(narrow(k, i));
     dropped(k);
