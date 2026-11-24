@@ -26,6 +26,16 @@ fn masked(a: &[u8; 129], k: i64) -> u8 {
     a[i]
 }
 
+#[inline(never)]
+fn masked_two(a: &[u8; 129], k: i64) -> u8 {
+    // The report's exact shape: mask to 126, add 2 in `i8`, cast to `usize`.
+    // `126 + 2` wraps to -128, so the analysis must not carry a non-negative
+    // bound through the cast and drop the check.
+    let x: i8 = core::hint::black_box(k as i8);
+    let i = (x & 126i8).wrapping_add(2) as usize;
+    a[i]
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     let k = arg(1);
@@ -36,5 +46,6 @@ pub extern "C" fn main() -> i64 {
     } else {
         out(literal(&a, k) as i64);
     }
+    out(masked_two(&b, k) as i64);
     0
 }
